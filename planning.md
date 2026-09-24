@@ -272,3 +272,8 @@ Recommended Implementation Order
 *   **Week 6:** Phase 6 — Bundled ADB & automatic USB port-forwarding.
     
 *   **Week 7+:** Phase 7 — Screen mirroring via MediaProjection and AVSampleBufferDisplayLayer.
+
+
+## Todo
+1 - QR Code its not needed anymore, and its being showed after the user connect, QR code must be showed in case of the device its not found
+2 - On Android when mac send a file to android, it looks like its android that its sending to macos, its not clear that file its being received

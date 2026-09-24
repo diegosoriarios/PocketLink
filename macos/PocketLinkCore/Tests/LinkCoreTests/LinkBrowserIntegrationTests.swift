@@ -14,6 +14,10 @@ final class ServiceAdvertiser: @unchecked Sendable {
         listener.start(queue: queue)
     }
 
+    var port: UInt16 {
+        listener.port?.rawValue ?? 0
+    }
+
     func stop() {
         queue.sync { listener.cancel() }
     }
@@ -66,5 +70,57 @@ final class LinkBrowserIntegrationTests: XCTestCase {
         let device = DiscoveredDevice(name: "Pixel", endpoint: endpoint)
         XCTAssertEqual(device.id, "Pixel")
         XCTAssertEqual(device.endpoint, endpoint)
+        XCTAssertEqual(device.hostText, "")
+    }
+}
+
+final class EndpointResolverIntegrationTests: XCTestCase {
+    func testResolvesAdvertisedServiceToIPAndPort() async throws {
+        let uniqueName = "TestResolve-\(ProcessInfo.processInfo.processIdentifier)"
+        let advertiser = try ServiceAdvertiser(name: uniqueName)
+        defer { advertiser.stop() }
+
+        let resolver = EndpointResolver()
+        var resolved: ResolvedEndpoint?
+        for _ in 0..<10 {
+            resolved = await resolver.resolve(name: uniqueName, type: "_link._tcp.", domain: "local.", timeout: 2)
+            if resolved != nil { break }
+        }
+
+        let endpoint = try XCTUnwrap(resolved, "service was not resolved to an address")
+        XCTAssertFalse(endpoint.ip.isEmpty)
+        XCTAssertEqual(endpoint.ip.split(separator: ".").count, 4)
+        let advertisedPort = advertiser.port
+        if advertisedPort != 0 {
+            XCTAssertEqual(endpoint.port, advertisedPort)
+        }
+    }
+
+    func testResolveReturnsNilAfterTimeout() async throws {
+        let resolver = EndpointResolver()
+        let resolved = await resolver.resolve(
+            name: "no-such-service-\(UUID().uuidString)",
+            type: "_link._tcp.",
+            domain: "local.",
+            timeout: 0.5
+        )
+        XCTAssertNil(resolved)
+    }
+}
+
+final class LocalIPAddressTests: XCTestCase {
+    func testPrimaryIPv4IsUsableWhenPresent() {
+        guard let address = LocalIPAddress.primaryIPv4() else {
+            return
+        }
+        XCTAssertFalse(address.hasPrefix("127."), "must not return loopback")
+        XCTAssertFalse(address.hasPrefix("169.254."), "must not return link-local")
+
+        let parts = address.split(separator: ".")
+        XCTAssertEqual(parts.count, 4, "expected a dotted quad, got \(address)")
+        XCTAssertTrue(
+            parts.allSatisfy { part in Int(part).map { (0...255).contains($0) } == true },
+            "expected a dotted quad, got \(address)"
+        )
     }
 }

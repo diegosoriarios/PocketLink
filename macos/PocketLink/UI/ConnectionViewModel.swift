@@ -1,4 +1,6 @@
 import AppKit
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import Foundation
 import Network
 import Observation
@@ -78,7 +80,9 @@ final class ConnectionViewModel {
     private var pendingEndpoint: NWEndpoint?
     private var pendingPeerId: String?
     private var activePairing: PendingPairing?
+    private(set) var pairingQRImage: NSImage?
     var pairingQRPayload: String? { activePairing?.token.qrPayload }
+    private(set) var macAddress = ""
     private let fileReceiver = FileReceiver()
     private var isSendingFile = false
     private var activeSendTask: Task<Void, Never>?
@@ -122,6 +126,7 @@ final class ConnectionViewModel {
         incomingDirectory = supportDirectory.appendingPathComponent("Incoming", isDirectory: true)
         deviceName = Host.current().localizedName ?? "Mac"
         self.reconnectPolicy = reconnectPolicy
+        macAddress = LocalIPAddress.primaryIPv4() ?? ""
         refreshTrustedPeers()
     }
 
@@ -150,6 +155,7 @@ final class ConnectionViewModel {
         pendingEndpoint = nil
         pendingPeerId = nil
         activePairing = nil
+        pairingQRImage = nil
         Task { [weak self] in
             guard let self else { return }
             try? await self.trustStore.trust(peerId, name: display)
@@ -165,11 +171,17 @@ final class ConnectionViewModel {
     func cancelPairing() {
         guard activePairing != nil else { return }
         activePairing = nil
+        pairingQRImage = nil
         pendingEndpoint = nil
         pendingPeerId = nil
         isUserDisconnect = true
         stopSession()
         phase = .idle
+    }
+
+    func startBrowsingIfNeeded() {
+        guard browser == nil, client == nil else { return }
+        startBrowsing()
     }
 
     func clearNotifications() {
@@ -208,6 +220,7 @@ final class ConnectionViewModel {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = progress.metadata.name
         panel.canCreateDirectories = true
+        NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         do {
             if FileManager.default.fileExists(atPath: destination.path) {
@@ -244,22 +257,43 @@ final class ConnectionViewModel {
             if trusted {
                 self.startSession(to: endpoint, peerId: peerId, display: display)
             } else {
-                self.beginPairing(to: endpoint, peerId: peerId, display: display)
+                self.preparePairing(to: endpoint, peerId: peerId, display: display)
             }
         }
     }
 
-    private func beginPairing(to endpoint: NWEndpoint, peerId: String, display: String) {
-        activePairing = PendingPairing(token: .generate(), peerId: peerId, display: display)
+    private func preparePairing(to endpoint: NWEndpoint, peerId: String, display: String) {
+        let token = PairingToken.generate()
+        activePairing = PendingPairing(token: token, peerId: peerId, display: display)
         pendingEndpoint = endpoint
         pendingPeerId = peerId
-        phase = .pairing(display: display)
         startSession(to: endpoint, peerId: peerId, display: display)
     }
 
+    private static let qrContext = CIContext()
+
+    private func makeQRImage(for payload: String) -> NSImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(payload.utf8)
+        filter.correctionLevel = "M"
+        guard let output = filter.outputImage else { return nil }
+        let scale = max(1, (240 / output.extent.width).rounded(.down))
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cgImage = Self.qrContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        return NSImage(cgImage: cgImage, size: NSSize(width: scaled.extent.width, height: scaled.extent.height))
+    }
+
     private func pairingAwarePhase(_ base: Phase) -> Phase {
-        guard let pairing = activePairing else { return base }
+        guard let pairing = activePairing, pairingQRImage != nil else { return base }
         return .pairing(display: pairing.display)
+    }
+
+    private func trustPeer(_ peerId: String, name: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            try? await self.trustStore.trust(peerId, name: name)
+            self.trustedPeers = await self.trustStore.trustedPeers()
+        }
     }
 
     func sendPing() {
@@ -277,6 +311,7 @@ final class ConnectionViewModel {
     func disconnect() {
         isUserDisconnect = true
         activePairing = nil
+        pairingQRImage = nil
         stopSession()
         phase = .idle
     }
@@ -355,16 +390,31 @@ final class ConnectionViewModel {
             await self?.runWithReconnect(
                 client: newClient,
                 endpoint: endpoint,
+                peerId: peerId,
                 display: display
             )
         }
     }
 
-    private func runWithReconnect(client: LinkClient, endpoint: NWEndpoint, display: String) async {
-        var outcome = await runSession(client: client, endpoint: endpoint, display: display)
+    private func runWithReconnect(client: LinkClient, endpoint: NWEndpoint, peerId: String, display: String) async {
+        var outcome = await runSession(client: client, endpoint: endpoint, peerId: peerId, display: display)
         guard outcome == .droppedUnexpectedly else { return }
         var attempt = 0
-        while !Task.isCancelled, let delay = reconnectPolicy.delay(forAttempt: attempt) {
+        while !Task.isCancelled, !isUserDisconnect {
+            guard let delay = reconnectPolicy.delay(forAttempt: attempt) else {
+                guard let pairing = activePairing else {
+                    phase = .failed("Could not reconnect")
+                    lastDeviceError = "Could not reconnect — scan and connect again"
+                    startBrowsing()
+                    return
+                }
+                if pairingQRImage == nil {
+                    pairingQRImage = makeQRImage(for: pairing.token.qrPayload)
+                    phase = .pairing(display: pairing.display)
+                }
+                attempt = 0
+                continue
+            }
             phase = pairingAwarePhase(.reconnecting(display: display))
             do {
                 try await Task.sleep(for: delay)
@@ -376,18 +426,13 @@ final class ConnectionViewModel {
             self.client = next
             pendingPing = nil
             phase = pairingAwarePhase(.connecting(display: display))
-            outcome = await runSession(client: next, endpoint: endpoint, display: display)
+            outcome = await runSession(client: next, endpoint: endpoint, peerId: peerId, display: display)
             guard outcome == .droppedUnexpectedly else { return }
             attempt += 1
         }
-        guard !Task.isCancelled else { return }
-        activePairing = nil
-        phase = .failed("Could not reconnect")
-        lastDeviceError = "Could not reconnect — scan and connect again"
-        startBrowsing()
     }
 
-    private func runSession(client: LinkClient, endpoint: NWEndpoint, display: String) async -> SessionOutcome {
+    private func runSession(client: LinkClient, endpoint: NWEndpoint, peerId: String, display: String) async -> SessionOutcome {
         let framesTask = Task { [weak self] in
             for await frame in client.frames {
                 self?.handleFrame(frame)
@@ -409,6 +454,7 @@ final class ConnectionViewModel {
                 ) {
                     try? await client.send(handshake)
                 }
+                trustPeer(peerId, name: display)
             case .failed(let reason):
                 phase = pairingAwarePhase(.failed(reason))
                 if !isUserDisconnect {
@@ -501,6 +547,7 @@ final class ConnectionViewModel {
         let peerId = pairing.peerId
         let display = pairing.display
         activePairing = nil
+        pairingQRImage = nil
         pendingEndpoint = nil
         pendingPeerId = nil
         Task { [weak self] in
@@ -525,6 +572,7 @@ final class ConnectionViewModel {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
+        NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
         sendFile(at: url)
     }

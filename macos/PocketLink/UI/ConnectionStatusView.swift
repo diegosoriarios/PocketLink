@@ -1,6 +1,4 @@
 import AppKit
-import CoreImage
-import CoreImage.CIFilterBuiltins
 import SwiftUI
 
 import LinkDiscovery
@@ -52,6 +50,12 @@ struct ConnectionStatusView: View {
                 trustedPeersSection
             }
 
+            if !model.macAddress.isEmpty {
+                Text("This Mac: \(model.macAddress)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
             Divider()
             Button("Quit PocketLink") {
                 NSApplication.shared.terminate(nil)
@@ -59,6 +63,7 @@ struct ConnectionStatusView: View {
         }
         .padding(14)
         .frame(width: 280, alignment: .leading)
+        .onAppear { model.startBrowsingIfNeeded() }
     }
 
     private var notificationsSection: some View {
@@ -131,7 +136,7 @@ struct ConnectionStatusView: View {
         case .reconnecting(let display):
             statusLabel(color: .orange, text: "Reconnecting to \(display)…")
         case .pairing(let display):
-            statusLabel(color: .yellow, text: "Pairing with \(display)…")
+            statusLabel(color: .yellow, text: "Device not found — pairing with \(display)…")
         case .failed(let reason):
             statusLabel(color: .red, text: "Failed — \(reason)")
         }
@@ -152,10 +157,10 @@ struct ConnectionStatusView: View {
 
     private var pairingControls: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Open PocketLink on your phone and scan this code")
+            Text("Open PocketLink on your phone and scan this code — connecting in the background…")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            if let payload = model.pairingQRPayload, let image = Self.qrImage(for: payload) {
+            if let image = model.pairingQRImage {
                 Image(nsImage: image)
                     .interpolation(.none)
                     .resizable()
@@ -201,13 +206,34 @@ struct ConnectionStatusView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if model.devices.isEmpty {
+                Text(
+                    model.isBrowsing
+                        ? "No devices found yet — make sure PocketLink is running on your phone."
+                        : "Tap the magnifying glass to scan for devices."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
             ForEach(model.devices) { device in
                 Button {
                     model.connect(to: device)
                 } label: {
-                    Label(device.name, systemImage: "iphone.gen3")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
+                    HStack(spacing: 8) {
+                        Image(systemName: "iphone.gen3")
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(device.name)
+                                .lineLimit(1)
+                            if !device.hostText.isEmpty {
+                                Text(device.hostText)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
@@ -364,19 +390,6 @@ struct ConnectionStatusView: View {
         case .failed(let reason):
             return "Failed — \(reason)"
         }
-    }
-
-    private static let qrContext = CIContext()
-
-    private static func qrImage(for payload: String) -> NSImage? {
-        let filter = CIFilter.qrCodeGenerator()
-        filter.message = Data(payload.utf8)
-        filter.correctionLevel = "M"
-        guard let output = filter.outputImage else { return nil }
-        let scale = max(1, (240 / output.extent.width).rounded(.down))
-        let scaled = output.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        guard let cgImage = qrContext.createCGImage(scaled, from: scaled.extent) else { return nil }
-        return NSImage(cgImage: cgImage, size: NSSize(width: scaled.extent.width, height: scaled.extent.height))
     }
 
     private func statusLabel(color: Color, text: String) -> some View {
