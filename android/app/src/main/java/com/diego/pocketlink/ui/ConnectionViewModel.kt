@@ -10,6 +10,7 @@ import com.diego.pocketlink.battery.BatteryStatus
 import com.diego.pocketlink.connection.ConnectionEvent
 import com.diego.pocketlink.connection.ConnectionService
 import com.diego.pocketlink.connection.ConnectionState
+import com.diego.pocketlink.connection.QrPairingPayload
 import com.diego.pocketlink.discovery.DiscoveredDevice
 import com.diego.pocketlink.files.TransferProgress
 import com.diego.pocketlink.notifications.LinkNotificationListenerService
@@ -147,6 +148,16 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         val success = ConnectionService.sendPing()
         if (!success) {
             addLog(ConnectionEvent(message = "Cannot send PING: Not connected"))
+        }
+    }
+
+    fun onQrScanned(raw: String) {
+        val token = QrPairingPayload.parse(raw)
+        if (token != null) {
+            ConnectionService.setPendingPairingToken(token)
+            addLog(ConnectionEvent(message = "Scanned pairing QR code. Waiting for Mac handshake..."))
+        } else {
+            addLog(ConnectionEvent(message = "Unrecognized QR payload: $raw"))
         }
     }
 

@@ -44,7 +44,7 @@ Connection policy (as implemented on Android):
 
 | ID       | Name        | Payload format |
 |----------|-------------|----------------|
-| `0x0001` | HANDSHAKE   | UTF-8 text (no schema enforced; Android logs only) |
+| `0x0001` | HANDSHAKE   | UTF-8 JSON: `{"device": "<str>", "platform": "<str>", "pairingToken": "<str, optional>"}` (see QR pairing below) |
 | `0x0002` | PING        | UTF-8 JSON: `{"timestamp": <epoch ms>}` |
 | `0x0003` | PONG        | Verbatim echo of PING payload; streamId copied from PING |
 | `0x0004` | DEVICE_INFO | Defined, unused by Android |
@@ -100,6 +100,30 @@ JSON is UTF-8 with these exact, case-sensitive key names.
   ignore (no ERROR frame). The phone never echoes reply contents to logs.
 - Compatibility: phones that predate this extension treat `0x0031` as an
   unknown type (ERROR 400 reply, connection survives).
+
+### QR pairing (protocol extension)
+
+- Not part of the original Android protocol. Adds a one-time pairing token to
+  the HANDSHAKE payload (`pairingToken` key, optional) so the phone can confirm
+  a pairing initiated by the Mac.
+- The Mac generates a **one-time token** (16 random bytes, base64url, no
+  padding — 22 characters), held in memory for **5 minutes, single use**. It
+  renders a QR code encoding:
+  `pocketlink://pair?v=1&t=<token>` (v = payload format version).
+- Flow: the Mac connects to the phone (normal flow) and sends HANDSHAKE
+  including `pairingToken` on every (re)connect while pairing is pending. The
+  phone scans the QR, stores the pending token, and when it sees a HANDSHAKE
+  whose `pairingToken` matches, replies with its own HANDSHAKE frame
+  (phone → Mac) carrying the scanned token. On match, the Mac auto-trusts the
+  peer and both sides mark the session as paired.
+- Compatibility:
+  - Phone without support: HANDSHAKE stays log-only; the Mac falls back to a
+    manual "trust" confirmation in its UI.
+  - Mac without support: phone HANDSHAKE frames are treated as an unknown
+    inbound message and ignored (older Macs had no HANDSHAKE handling).
+- The token is proximity proof only (someone physically scanned the screen);
+  it is not a shared secret over an encrypted channel — the wire remains
+  plaintext until the encryption milestone.
 
 ## Transport
 

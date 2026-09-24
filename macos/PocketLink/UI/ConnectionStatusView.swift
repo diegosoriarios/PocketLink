@@ -1,3 +1,6 @@
+import AppKit
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import SwiftUI
 
 import LinkDiscovery
@@ -15,8 +18,8 @@ struct ConnectionStatusView: View {
             switch model.phase {
             case .connected:
                 connectedControls
-            case .needsTrust:
-                trustControls
+            case .pairing:
+                pairingControls
             default:
                 connectControls
             }
@@ -127,8 +130,8 @@ struct ConnectionStatusView: View {
             statusLabel(color: .green, text: "Connected · \(display)")
         case .reconnecting(let display):
             statusLabel(color: .orange, text: "Reconnecting to \(display)…")
-        case .needsTrust(let display):
-            statusLabel(color: .yellow, text: "Trust \(display)?")
+        case .pairing(let display):
+            statusLabel(color: .yellow, text: "Pairing with \(display)…")
         case .failed(let reason):
             statusLabel(color: .red, text: "Failed — \(reason)")
         }
@@ -147,14 +150,27 @@ struct ConnectionStatusView: View {
         }
     }
 
-    private var trustControls: some View {
+    private var pairingControls: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("First time connecting to this device. Trust it?")
+            Text("Open PocketLink on your phone and scan this code")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if let payload = model.pairingQRPayload, let image = Self.qrImage(for: payload) {
+                Image(nsImage: image)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 180, height: 180)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityLabel("Pairing QR code")
+            } else {
+                Text("Could not render QR code — use manual trust below.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             HStack(spacing: 10) {
-                Button("Trust & Connect") { model.confirmTrust() }
-                Button("Cancel") { model.cancelTrust() }
+                Button("Trust manually instead") { model.confirmTrust() }
+                Button("Cancel") { model.cancelPairing() }
             }
         }
     }
@@ -348,6 +364,19 @@ struct ConnectionStatusView: View {
         case .failed(let reason):
             return "Failed — \(reason)"
         }
+    }
+
+    private static let qrContext = CIContext()
+
+    private static func qrImage(for payload: String) -> NSImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(payload.utf8)
+        filter.correctionLevel = "M"
+        guard let output = filter.outputImage else { return nil }
+        let scale = max(1, (240 / output.extent.width).rounded(.down))
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cgImage = qrContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        return NSImage(cgImage: cgImage, size: NSSize(width: scaled.extent.width, height: scaled.extent.height))
     }
 
     private func statusLabel(color: Color, text: String) -> some View {

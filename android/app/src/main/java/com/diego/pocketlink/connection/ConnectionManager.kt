@@ -263,7 +263,45 @@ class ConnectionManager(
             }
             MessageType.HANDSHAKE -> {
                 val body = frame.payload.toString(Charsets.UTF_8)
-                logEvent("Received HANDSHAKE: $body")
+                val json = try {
+                    JSONObject(body)
+                } catch (_: Exception) {
+                    null
+                }
+                val deviceName = json?.optString("device")?.takeIf { it.isNotBlank() } ?: "Unknown"
+                val incomingToken = json?.optString("pairingToken")?.takeIf { it.isNotBlank() }
+
+                val pending = ConnectionService.pendingPairingToken
+                val now = System.currentTimeMillis()
+
+                if (pending != null && !pending.isExpired(now) && incomingToken != null && incomingToken == pending.value) {
+                    logEvent("Paired via QR with $deviceName")
+                    ConnectionService.clearPendingPairingToken()
+
+                    val localDeviceName = try {
+                        Class.forName("android.os.Build").getField("MODEL").get(null) as? String
+                    } catch (_: Throwable) {
+                        null
+                    } ?: "Android"
+
+                    val responseJson = JSONObject().apply {
+                        put("device", localDeviceName)
+                        put("platform", "Android")
+                        put("pairingToken", pending.value)
+                    }
+                    val payload = responseJson.toString().toByteArray(Charsets.UTF_8)
+                    val responseFrame = Frame(
+                        header = FrameHeader(
+                            messageType = MessageType.HANDSHAKE,
+                            streamId = frame.header.streamId,
+                            payloadLength = payload.size.toUInt()
+                        ),
+                        payload = payload
+                    )
+                    sendFrameOnSocket(socket, responseFrame)
+                } else {
+                    logEvent("Received HANDSHAKE: $body")
+                }
             }
             else -> {
                 logEvent("Received ${frame.header.messageType} frame (${frame.payload.size} bytes)")

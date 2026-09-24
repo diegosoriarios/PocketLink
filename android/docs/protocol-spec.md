@@ -64,3 +64,30 @@ Every frame begins with a fixed 16-byte header:
 ## Security Note
 
 In early milestones, frames are transmitted unencrypted over the local Wi-Fi connection. In future milestones, an authenticated and encrypted layer (such as Noise Protocol / TLS with pinned certificates via QR code pairing) will wrap the frame payload or stream.
+
+---
+
+## Message Details
+
+### HANDSHAKE (`0x0001`)
+
+The HANDSHAKE frame is exchanged during connection initialization. Its payload is a UTF-8 JSON object:
+
+```json
+{"device": "<name>", "platform": "<platform>", "pairingToken": "<optional string>"}
+```
+
+- `device`: Device name (e.g. `"Pixel 8"`, `"Diego's Mac"`).
+- `platform`: Operating system platform (`"Android"`, `"macOS"`).
+- `pairingToken`: Optional single-use token when executing QR-based device pairing.
+
+### QR Pairing Flow (Protocol Extension)
+
+1. The macOS app displays a QR code containing a one-time pairing token:
+   `pocketlink://pair?v=1&t=<token>`
+2. The phone scans the QR code and stores the token as a pending in-memory pairing token (5-minute expiration).
+3. The Mac sends a `HANDSHAKE` frame with `pairingToken` set to `<token>`.
+4. If the token matches the phone's non-expired pending token, the phone responds on the same socket with a `HANDSHAKE` frame containing:
+   `{"device": "<Model>", "platform": "Android", "pairingToken": "<token>"}`
+   and clears the pending token.
+5. If no token is pending or the token does not match / is expired, the phone accepts the connection without replying with a pairing HANDSHAKE.

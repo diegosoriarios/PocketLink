@@ -1,5 +1,7 @@
 package com.diego.pocketlink.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -39,15 +41,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.diego.pocketlink.battery.BatteryStatus
 import com.diego.pocketlink.connection.ConnectionState
 import com.diego.pocketlink.discovery.DiscoveredDevice
 import com.diego.pocketlink.files.TransferProgress
 import com.diego.pocketlink.files.TransferState
+import com.diego.pocketlink.qr.QrScannerScreen
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,62 +73,100 @@ fun ConnectionScreen(
         uri?.let { viewModel.sendFile(it) }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Link Companion") }
-            )
-        },
-        modifier = modifier
-    ) { innerPadding ->
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            item {
-                ConnectionStatusCard(
-                    state = uiState,
-                    onStart = { viewModel.startService() },
-                    onStop = { viewModel.stopService() },
-                    onSendPing = { viewModel.sendPing() }
-                )
-            }
+    val context = LocalContext.current
+    var showQrScanner by remember { mutableStateOf(false) }
 
-            item {
-                FileTransferCard(
-                    isConnected = uiState is ConnectionState.Connected,
-                    progress = transferProgress,
-                    onPickFile = { filePickerLauncher.launch("*/*") },
-                    onCancel = { viewModel.cancelFileTransfer() }
-                )
-            }
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            showQrScanner = true
+        }
+    }
 
-            item {
-                NotificationForwardingCard(
-                    isGranted = isNotificationGranted,
-                    onOpenSettings = { viewModel.openNotificationListenerSettings() }
-                )
-            }
+    val onScanClick = {
+        val hasPermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        if (hasPermission) {
+            showQrScanner = true
+        } else {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
 
-            item {
-                BatteryAndClipboardCard(
-                    batteryStatus = batteryStatus,
-                    isConnected = uiState is ConnectionState.Connected,
-                    onSyncClipboard = { viewModel.syncClipboardNow() }
-                )
+    if (showQrScanner) {
+        QrScannerScreen(
+            onDismiss = { showQrScanner = false },
+            onResult = { raw ->
+                viewModel.onQrScanned(raw)
+                showQrScanner = false
             }
+        )
+    } else {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("Link Companion") }
+                )
+            },
+            modifier = modifier
+        ) { innerPadding ->
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                item {
+                    ConnectionStatusCard(
+                        state = uiState,
+                        onStart = { viewModel.startService() },
+                        onStop = { viewModel.stopService() },
+                        onSendPing = { viewModel.sendPing() }
+                    )
+                }
 
-            item {
-                DiscoveredDevicesCard(
-                    devices = discoveredDevices,
-                    onConnect = { device ->
-                        viewModel.connectToHost(device.host, device.port.toString())
-                    }
-                )
-            }
+                item {
+                    FileTransferCard(
+                        isConnected = uiState is ConnectionState.Connected,
+                        progress = transferProgress,
+                        onPickFile = { filePickerLauncher.launch("*/*") },
+                        onCancel = { viewModel.cancelFileTransfer() }
+                    )
+                }
+
+                item {
+                    NotificationForwardingCard(
+                        isGranted = isNotificationGranted,
+                        onOpenSettings = { viewModel.openNotificationListenerSettings() }
+                    )
+                }
+
+                item {
+                    BatteryAndClipboardCard(
+                        batteryStatus = batteryStatus,
+                        isConnected = uiState is ConnectionState.Connected,
+                        onSyncClipboard = { viewModel.syncClipboardNow() }
+                    )
+                }
+
+                item {
+                    QrPairingCard(
+                        onScanClick = onScanClick
+                    )
+                }
+
+                item {
+                    DiscoveredDevicesCard(
+                        devices = discoveredDevices,
+                        onConnect = { device ->
+                            viewModel.connectToHost(device.host, device.port.toString())
+                        }
+                    )
+                }
 
             item {
                 ManualConnectionCard(
@@ -139,6 +182,41 @@ fun ConnectionScreen(
                     onClearLogs = { viewModel.clearLogs() },
                     modifier = Modifier.height(260.dp)
                 )
+            }
+        }
+    }
+}
+}
+
+@Composable
+private fun QrPairingCard(
+    onScanClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "QR Code Pairing",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = "Scan the pairing QR code displayed on your Mac to automatically pair and trust this phone.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
+            )
+            Button(
+                onClick = onScanClick,
+                modifier = Modifier.align(Alignment.End)
+            ) {
+                Text("Scan Pairing Code")
             }
         }
     }

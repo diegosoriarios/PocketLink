@@ -13,6 +13,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -83,6 +84,61 @@ class ConnectionManagerTest {
         val responseFrame = frames[0]
         assertEquals(MessageType.PONG, responseFrame.header.messageType)
         assertEquals(99u, responseFrame.header.streamId)
+
+        clientSocket.close()
+        connectionManager.stopServer()
+    }
+
+    @Test
+    fun testHandshakeWithMatchingPairingTokenRespondsWithHandshake() = runBlocking {
+        ConnectionService.setPendingPairingToken("valid-token-1234567890")
+
+        connectionManager.startServer(0)
+        val state = connectionManager.connectionState.first { it is ConnectionState.Listening }
+        val listeningPort = (state as ConnectionState.Listening).port
+
+        val clientSocket = Socket("127.0.0.1", listeningPort)
+        clientSocket.soTimeout = 2000
+        val outStream: OutputStream = clientSocket.getOutputStream()
+        val inStream: InputStream = clientSocket.getInputStream()
+
+        connectionManager.connectionState.first { it is ConnectionState.Connected }
+
+        val eventsList = mutableListOf<String>()
+        val job = testScope.launch {
+            connectionManager.events.collect { eventsList.add(it.message) }
+        }
+
+        val handshakePayload = """{"device":"MacBook Pro","platform":"macOS","pairingToken":"valid-token-1234567890"}""".toByteArray(Charsets.UTF_8)
+        val handshakeFrame = Frame(
+            header = FrameHeader(
+                messageType = MessageType.HANDSHAKE,
+                streamId = 100u,
+                payloadLength = handshakePayload.size.toUInt()
+            ),
+            payload = handshakePayload
+        )
+        outStream.write(ProtocolEncoder.encode(handshakeFrame))
+        outStream.flush()
+
+        val decoder = ProtocolDecoder()
+        val buffer = ByteArray(1024)
+        val readBytes = inStream.read(buffer)
+        job.cancel()
+        assertTrue(readBytes > 0)
+
+        val frames = decoder.feed(buffer, 0, readBytes)
+        assertEquals(1, frames.size)
+
+        val responseFrame = frames[0]
+        assertEquals(MessageType.HANDSHAKE, responseFrame.header.messageType)
+        assertEquals(100u, responseFrame.header.streamId)
+
+        val jsonStr = responseFrame.payload.toString(Charsets.UTF_8)
+        assertTrue(jsonStr.contains("valid-token-1234567890"))
+        assertTrue(jsonStr.contains("Android"))
+
+        org.junit.Assert.assertNull(ConnectionService.pendingPairingToken)
 
         clientSocket.close()
         connectionManager.stopServer()

@@ -225,6 +225,18 @@ class ConnectionService : Service() {
         private var _transferProgressFlow: StateFlow<TransferProgress?>? = null
         val transferProgressFlow: StateFlow<TransferProgress?>? get() = _transferProgressFlow
 
+        @Volatile
+        var pendingPairingToken: PendingPairingToken? = null
+            private set
+
+        fun setPendingPairingToken(token: String) {
+            pendingPairingToken = PendingPairingToken(token)
+        }
+
+        fun clearPendingPairingToken() {
+            pendingPairingToken = null
+        }
+
         var instance: ConnectionService? = null
             private set
 

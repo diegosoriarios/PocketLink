@@ -92,4 +92,75 @@ final class HandshakeMessageTests: XCTestCase {
         let device = dictionary["device"] as? String
         XCTAssertEqual(device, "quote\"back\\slash")
     }
+
+    func testFrameCarriesPairingTokenAndParsesBack() throws {
+        let frame = try HandshakeMessage.frame(deviceName: "Diego's MacBook", pairingToken: "abc123")
+        let object = try JSONSerialization.jsonObject(with: Data(frame.payload))
+        let dictionary = try XCTUnwrap(object as? [String: Any])
+        XCTAssertEqual(dictionary["pairingToken"] as? String, "abc123")
+
+        let info = try XCTUnwrap(HandshakeMessage.parse(frame))
+        XCTAssertEqual(info.device, "Diego's MacBook")
+        XCTAssertEqual(info.platform, "macOS")
+        XCTAssertEqual(info.pairingToken, "abc123")
+    }
+
+    func testFrameOmitsPairingTokenWhenAbsent() throws {
+        let frame = try HandshakeMessage.frame(deviceName: "Diego's MacBook")
+        let object = try JSONSerialization.jsonObject(with: Data(frame.payload))
+        let dictionary = try XCTUnwrap(object as? [String: Any])
+        XCTAssertFalse(dictionary.keys.contains("pairingToken"))
+
+        let info = try XCTUnwrap(HandshakeMessage.parse(frame))
+        XCTAssertNil(info.pairingToken)
+    }
+
+    func testParseRejectsWrongTypeAndMalformedPayload() throws {
+        let frame = try HandshakeMessage.frame(deviceName: "Mac")
+        let wrongType = Frame(messageType: .ping, streamId: 1, payload: frame.payload)
+        XCTAssertNil(HandshakeMessage.parse(wrongType))
+        XCTAssertNil(HandshakeMessage.parse(Frame(messageType: .handshake, streamId: 0, payload: [UInt8]("not json".utf8))))
+    }
+
+    func testParsesLegacyPayloadWithoutPlatform() throws {
+        let legacy = Frame(messageType: .handshake, streamId: 0, payloadString: "{\"device\":\"Pixel 8\"}")
+        let info = try XCTUnwrap(HandshakeMessage.parse(legacy))
+        XCTAssertEqual(info.device, "Pixel 8")
+        XCTAssertEqual(info.platform, "")
+        XCTAssertNil(info.pairingToken)
+    }
+}
+
+final class PairingTokenTests: XCTestCase {
+    func testGenerateProducesUniqueBase64URLValues() {
+        let first = PairingToken.generate()
+        let second = PairingToken.generate()
+        XCTAssertNotEqual(first.value, second.value)
+        XCTAssertEqual(first.value.count, 22)
+        XCTAssertFalse(first.value.contains("+"))
+        XCTAssertFalse(first.value.contains("/"))
+        XCTAssertFalse(first.value.contains("="))
+    }
+
+    func testMatchesExactValueWhileLive() {
+        let token = PairingToken(value: "abc", createdAt: Date(), lifetime: 300)
+        XCTAssertTrue(token.matches("abc"))
+        XCTAssertFalse(token.matches("xyz"))
+        XCTAssertFalse(token.isExpired)
+    }
+
+    func testExpiredTokenNeverMatches() {
+        let token = PairingToken(
+            value: "abc",
+            createdAt: Date(timeIntervalSinceNow: -301),
+            lifetime: 300
+        )
+        XCTAssertTrue(token.isExpired)
+        XCTAssertFalse(token.matches("abc"))
+    }
+
+    func testQRPayloadFormat() {
+        let token = PairingToken(value: "AbC-dE_", createdAt: Date())
+        XCTAssertEqual(token.qrPayload, "pocketlink://pair?v=1&t=AbC-dE_")
+    }
 }

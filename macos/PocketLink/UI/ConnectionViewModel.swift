@@ -20,12 +20,18 @@ final class ConnectionViewModel {
         case connected(display: String)
         case reconnecting(display: String)
         case failed(String)
-        case needsTrust(display: String)
+        case pairing(display: String)
     }
 
     private enum SessionOutcome {
         case ended
         case droppedUnexpectedly
+    }
+
+    private struct PendingPairing: Equatable {
+        let token: PairingToken
+        let peerId: String
+        let display: String
     }
 
     private(set) var phase: Phase = .idle
@@ -71,6 +77,8 @@ final class ConnectionViewModel {
     private let incomingDirectory: URL
     private var pendingEndpoint: NWEndpoint?
     private var pendingPeerId: String?
+    private var activePairing: PendingPairing?
+    var pairingQRPayload: String? { activePairing?.token.qrPayload }
     private let fileReceiver = FileReceiver()
     private var isSendingFile = false
     private var activeSendTask: Task<Void, Never>?
@@ -137,22 +145,31 @@ final class ConnectionViewModel {
     }
 
     func confirmTrust() {
-        guard case .needsTrust(let display) = phase, let endpoint = pendingEndpoint else { return }
+        guard case .pairing(let display) = phase, let endpoint = pendingEndpoint else { return }
         let peerId = pendingPeerId ?? display
         pendingEndpoint = nil
         pendingPeerId = nil
+        activePairing = nil
         Task { [weak self] in
             guard let self else { return }
             try? await self.trustStore.trust(peerId, name: display)
             self.trustedPeers = await self.trustStore.trustedPeers()
-            self.startSession(to: endpoint, peerId: peerId, display: display)
+            if self.client != nil {
+                self.phase = .connected(display: display)
+            } else {
+                self.startSession(to: endpoint, peerId: peerId, display: display)
+            }
         }
     }
 
-    func cancelTrust() {
+    func cancelPairing() {
+        guard activePairing != nil else { return }
+        activePairing = nil
         pendingEndpoint = nil
         pendingPeerId = nil
-        if case .needsTrust = phase { phase = .idle }
+        isUserDisconnect = true
+        stopSession()
+        phase = .idle
     }
 
     func clearNotifications() {
@@ -227,11 +244,22 @@ final class ConnectionViewModel {
             if trusted {
                 self.startSession(to: endpoint, peerId: peerId, display: display)
             } else {
-                self.pendingEndpoint = endpoint
-                self.pendingPeerId = peerId
-                self.phase = .needsTrust(display: display)
+                self.beginPairing(to: endpoint, peerId: peerId, display: display)
             }
         }
+    }
+
+    private func beginPairing(to endpoint: NWEndpoint, peerId: String, display: String) {
+        activePairing = PendingPairing(token: .generate(), peerId: peerId, display: display)
+        pendingEndpoint = endpoint
+        pendingPeerId = peerId
+        phase = .pairing(display: display)
+        startSession(to: endpoint, peerId: peerId, display: display)
+    }
+
+    private func pairingAwarePhase(_ base: Phase) -> Phase {
+        guard let pairing = activePairing else { return base }
+        return .pairing(display: pairing.display)
     }
 
     func sendPing() {
@@ -248,6 +276,7 @@ final class ConnectionViewModel {
 
     func disconnect() {
         isUserDisconnect = true
+        activePairing = nil
         stopSession()
         phase = .idle
     }
@@ -319,7 +348,7 @@ final class ConnectionViewModel {
         lastEndpoint = endpoint
         lastPeerId = peerId
         lastDisplay = display
-        phase = .connecting(display: display)
+        phase = pairingAwarePhase(.connecting(display: display))
         lastRoundTrip = ""
         lastDeviceError = ""
         sessionTask = Task { [weak self] in
@@ -336,7 +365,7 @@ final class ConnectionViewModel {
         guard outcome == .droppedUnexpectedly else { return }
         var attempt = 0
         while !Task.isCancelled, let delay = reconnectPolicy.delay(forAttempt: attempt) {
-            phase = .reconnecting(display: display)
+            phase = pairingAwarePhase(.reconnecting(display: display))
             do {
                 try await Task.sleep(for: delay)
             } catch {
@@ -346,12 +375,13 @@ final class ConnectionViewModel {
             let next = LinkClient()
             self.client = next
             pendingPing = nil
-            phase = .connecting(display: display)
+            phase = pairingAwarePhase(.connecting(display: display))
             outcome = await runSession(client: next, endpoint: endpoint, display: display)
             guard outcome == .droppedUnexpectedly else { return }
             attempt += 1
         }
         guard !Task.isCancelled else { return }
+        activePairing = nil
         phase = .failed("Could not reconnect")
         lastDeviceError = "Could not reconnect — scan and connect again"
         startBrowsing()
@@ -372,12 +402,15 @@ final class ConnectionViewModel {
             case .idle, .connecting:
                 break
             case .connected:
-                phase = .connected(display: display)
-                if let handshake = try? HandshakeMessage.frame(deviceName: deviceName) {
+                phase = pairingAwarePhase(.connected(display: display))
+                if let handshake = try? HandshakeMessage.frame(
+                    deviceName: deviceName,
+                    pairingToken: activePairing?.token.value
+                ) {
                     try? await client.send(handshake)
                 }
             case .failed(let reason):
-                phase = .failed(reason)
+                phase = pairingAwarePhase(.failed(reason))
                 if !isUserDisconnect {
                     lastDeviceError = "Connection lost — \(reason)"
                     outcome = .droppedUnexpectedly
@@ -385,7 +418,7 @@ final class ConnectionViewModel {
                 break loop
             case .closed:
                 if case .failed = phase {} else if !isUserDisconnect {
-                    phase = .idle
+                    phase = pairingAwarePhase(.idle)
                     lastDeviceError = "Disconnected"
                     outcome = .droppedUnexpectedly
                 }
@@ -454,9 +487,28 @@ final class ConnectionViewModel {
             if notifications.count > 20 {
                 notifications.removeLast(notifications.count - 20)
             }
+        case .handshake:
+            guard let info = HandshakeMessage.parse(frame) else { return }
+            handleHandshake(info)
         default:
             break
         }
+    }
+
+    private func handleHandshake(_ info: HandshakeInfo) {
+        guard let pairing = activePairing, let candidate = info.pairingToken,
+              pairing.token.matches(candidate) else { return }
+        let peerId = pairing.peerId
+        let display = pairing.display
+        activePairing = nil
+        pendingEndpoint = nil
+        pendingPeerId = nil
+        Task { [weak self] in
+            guard let self else { return }
+            try? await self.trustStore.trust(peerId, name: display)
+            self.trustedPeers = await self.trustStore.trustedPeers()
+        }
+        phase = .connected(display: display)
     }
 
     private func updateTransfer(_ progress: FileReceiver.Progress) {
