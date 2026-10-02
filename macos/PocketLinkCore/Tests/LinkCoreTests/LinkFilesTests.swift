@@ -156,15 +156,16 @@ final class FileReceiverTests: XCTestCase {
         FileMetadata(fileId: fileId, name: name, size: size, sha256: sha256, mimeType: "text/plain")
     }
 
-    func testHappyPathCompletesWithSuccessAndCorrectContent() throws {
+    func testHappyPathCompletesWithSuccessAndCorrectContent() async throws {
         let directory = try tempDirectory()
         let payload = Data("hello world".utf8)
         let receiver = FileReceiver()
-        let started = try receiver.begin(metadata(size: Int64(payload.count), sha256: SecurityHash.hex(payload)), in: directory)
+        let started = try await receiver.begin(metadata(size: Int64(payload.count), sha256: SecurityHash.hex(payload)), in: directory)
         XCTAssertEqual(started.state, .receiving)
         XCTAssertEqual(started.receivedBytes, 0)
 
-        let outcome = try XCTUnwrap(receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("abc12345"), offset: 0, data: payload)))
+        let appended = try await receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("abc12345"), offset: 0, data: payload))
+        let outcome = try XCTUnwrap(appended)
         guard case .finished(let progress, let ack) = outcome else {
             return XCTFail("Expected finished outcome")
         }
@@ -176,11 +177,12 @@ final class FileReceiverTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fileURL), payload)
     }
 
-    func testShaMismatchFailsAndDeletesFile() throws {
+    func testShaMismatchFailsAndDeletesFile() async throws {
         let directory = try tempDirectory()
         let receiver = FileReceiver()
-        let started = try receiver.begin(metadata(size: 3, sha256: "00"), in: directory)
-        let outcome = try XCTUnwrap(receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("abc12345"), offset: 0, data: Data("abc".utf8))))
+        let started = try await receiver.begin(metadata(size: 3, sha256: "00"), in: directory)
+        let appended = try await receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("abc12345"), offset: 0, data: Data("abc".utf8)))
+        let outcome = try XCTUnwrap(appended)
         guard case .finished(let progress, let ack) = outcome else {
             return XCTFail("Expected finished outcome")
         }
@@ -192,29 +194,30 @@ final class FileReceiverTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: FileReceiver.fileURL(for: started.metadata, in: directory).path))
     }
 
-    func testEmptyFileCompletesOnBegin() throws {
+    func testEmptyFileCompletesOnBegin() async throws {
         let directory = try tempDirectory()
         let receiver = FileReceiver()
-        let progress = try receiver.begin(metadata(size: 0, sha256: SecurityHash.hex(Data())), in: directory)
+        let progress = try await receiver.begin(metadata(size: 0, sha256: SecurityHash.hex(Data())), in: directory)
         XCTAssertEqual(progress.state, .completed)
         let fileURL = FileReceiver.fileURL(for: progress.metadata, in: directory)
         XCTAssertEqual(try Data(contentsOf: fileURL), Data())
     }
 
-    func testNewHeaderAbandonsPreviousTransfer() throws {
+    func testNewHeaderAbandonsPreviousTransfer() async throws {
         let directory = try tempDirectory()
         let receiver = FileReceiver()
-        let first = try receiver.begin(metadata(size: 10, sha256: "00"), in: directory)
-        _ = try receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("abc12345"), offset: 0, data: Data("abc".utf8)))
+        let first = try await receiver.begin(metadata(size: 10, sha256: "00"), in: directory)
+        _ = try await receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("abc12345"), offset: 0, data: Data("abc".utf8)))
 
-        let second = try receiver.begin(metadata(size: 3, sha256: SecurityHash.hex(Data("xyz".utf8)), fileId: "def67890"), in: directory)
+        let second = try await receiver.begin(metadata(size: 3, sha256: SecurityHash.hex(Data("xyz".utf8)), fileId: "def67890"), in: directory)
         XCTAssertEqual(second.state, .receiving)
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: FileReceiver.fileURL(for: first.metadata, in: directory).path),
             "First transfer's partial file should be deleted"
         )
 
-        let outcome = try XCTUnwrap(receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("def67890"), offset: 0, data: Data("xyz".utf8))))
+        let appended = try await receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("def67890"), offset: 0, data: Data("xyz".utf8)))
+        let outcome = try XCTUnwrap(appended)
         guard case .finished(let progress, let ack) = outcome else {
             return XCTFail("Expected finished outcome")
         }
@@ -222,9 +225,9 @@ final class FileReceiverTests: XCTestCase {
         XCTAssertEqual(ack, .success)
     }
 
-    func testAppendWithoutActiveTransferIsIgnored() throws {
+    func testAppendWithoutActiveTransferIsIgnored() async throws {
         let receiver = FileReceiver()
-        let outcome = try receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("abc12345"), offset: 0, data: Data("abc".utf8)))
+        let outcome = try await receiver.append(FileChunk(fileIdHash: JavaStringHash.hash("abc12345"), offset: 0, data: Data("abc".utf8)))
         XCTAssertNil(outcome)
     }
 

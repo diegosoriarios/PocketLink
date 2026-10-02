@@ -1,8 +1,8 @@
 package com.diego.pocketlink.clipboard
 
+import android.content.Context
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 
@@ -11,23 +11,44 @@ class ClipboardSyncManager(
     private val onLocalClipboardChanged: (String) -> Unit
 ) {
     private val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    
-    // Suppression threshold to avoid infinite sync loops
-    private var lastSentOrReceivedText: String? = null
+
+    // Per-direction markers: prevents sync loops (a remote-applied text must not
+    // be re-sent by the local listener, and vice versa). The local marker is
+    // time-bounded so legitimately re-copying the same text later still syncs.
+    private var lastLocalSentText: String? = null
+    private var lastLocalSentAt = 0L
+    private var lastRemoteAppliedText: String? = null
     private var lastSetTimestamp: Long = 0L
 
+    @Volatile
+    var isAutoSendEnabled: Boolean = ClipboardSettings.load(context)
+
+    var duplicateSuppressWindowMs: Long = DUPLICATE_SUPPRESS_WINDOW_MS
+
     private val clipChangedListener = ClipboardManager.OnPrimaryClipChangedListener {
-        // Debounce / suppress self-triggered updates
+        if (!isAutoSendEnabled) {
+            return@OnPrimaryClipChangedListener
+        }
+        // Debounce / suppress self-triggered updates right after a remote write
         if (SystemClock.elapsedRealtime() - lastSetTimestamp < DEBOUNCE_MS) {
             return@OnPrimaryClipChangedListener
         }
 
         val text = readLocalClipboard() ?: return@OnPrimaryClipChangedListener
-        if (text == lastSentOrReceivedText || text.isBlank()) {
+        if (text.isBlank()) {
+            return@OnPrimaryClipChangedListener
+        }
+        if (text == lastRemoteAppliedText) {
+            return@OnPrimaryClipChangedListener
+        }
+        if (text == lastLocalSentText &&
+            SystemClock.elapsedRealtime() - lastLocalSentAt < duplicateSuppressWindowMs
+        ) {
             return@OnPrimaryClipChangedListener
         }
 
-        lastSentOrReceivedText = text
+        lastLocalSentText = text
+        lastLocalSentAt = SystemClock.elapsedRealtime()
         Log.d(TAG, "Local clipboard updated (${text.length} chars)")
         onLocalClipboardChanged(text)
     }
@@ -49,12 +70,12 @@ class ClipboardSyncManager(
     }
 
     fun setRemoteClipboard(text: String): Boolean {
-        if (text == lastSentOrReceivedText) {
+        if (text == lastRemoteAppliedText) {
             Log.d(TAG, "Suppressed duplicate incoming remote clipboard text")
             return false
         }
 
-        lastSentOrReceivedText = text
+        lastRemoteAppliedText = text
         lastSetTimestamp = SystemClock.elapsedRealtime()
 
         return try {
@@ -80,8 +101,13 @@ class ClipboardSyncManager(
         }
     }
 
+    fun markLocallySent(text: String) {
+        lastLocalSentText = text
+    }
+
     companion object {
         private const val TAG = "ClipboardSyncManager"
         private const val DEBOUNCE_MS = 1000L
+        private const val DUPLICATE_SUPPRESS_WINDOW_MS = 30_000L
     }
 }

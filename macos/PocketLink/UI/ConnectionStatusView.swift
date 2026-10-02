@@ -5,9 +5,11 @@ import LinkDiscovery
 import LinkFiles
 import LinkNotifications
 import LinkPairing
+import LinkProtocol
 
 struct ConnectionStatusView: View {
     @State private var model = ConnectionViewModel()
+    @State private var isDropTargeted = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -37,6 +39,11 @@ struct ConnectionStatusView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if !model.clipboardSyncStatus.isEmpty {
+                Text(model.clipboardSyncStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             if !model.notifications.isEmpty {
                 notificationsSection
@@ -44,6 +51,10 @@ struct ConnectionStatusView: View {
 
             if !model.fileTransfers.isEmpty || !model.outgoingTransfers.isEmpty {
                 filesSection
+            }
+
+            if !model.transferHistory.isEmpty {
+                recentTransfersSection
             }
 
             if !model.trustedPeers.isEmpty {
@@ -63,6 +74,22 @@ struct ConnectionStatusView: View {
         }
         .padding(14)
         .frame(width: 280, alignment: .leading)
+        .overlay {
+            if isDropTargeted {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.accentColor.opacity(0.08))
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
+                    Text("Drop to send to phone")
+                        .font(.callout.weight(.medium))
+                }
+            }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            model.sendDroppedFiles(urls)
+            return true
+        } isTargeted: { isDropTargeted = $0 }
         .onAppear { model.startBrowsingIfNeeded() }
     }
 
@@ -77,51 +104,99 @@ struct ConnectionStatusView: View {
                     .buttonStyle(.borderless)
                     .font(.caption)
             }
-            ForEach(model.notifications) { notification in
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: notification.symbolName)
-                        .foregroundStyle(.secondary)
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(notification.title.isEmpty ? notification.appName : notification.title)
-                                .font(.subheadline.weight(.medium))
-                                .lineLimit(1)
-                            Spacer()
-                            Text(notification.postTime, style: .relative)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        if !notification.text.isEmpty {
-                            Text(notification.text)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-                        if notification.hasQuickReply {
-                            HStack(spacing: 6) {
-                                TextField(
-                                    "Reply…",
-                                    text: Binding(
-                                        get: { model.replyDrafts[notification.id] ?? "" },
-                                        set: { model.replyDrafts[notification.id] = $0 }
-                                    )
-                                )
-                                .textFieldStyle(.roundedBorder)
-                                .font(.caption)
-                                .onSubmit { model.sendReply(to: notification) }
-                                Button {
-                                    model.sendReply(to: notification)
-                                } label: {
-                                    Image(systemName: "paperplane.fill")
-                                }
-                                .buttonStyle(.borderless)
-                                .disabled(!model.isReplyEnabled(for: notification))
-                            }
-                        }
+            ForEach(groupedNotifications, id: \.app) { group in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Image(systemName: group.items.first?.symbolName ?? "bell.fill")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                        Text(group.app)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(group.items.count)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(group.items) { notification in
+                        notificationRow(notification)
                     }
                 }
             }
         }
+    }
+
+    private func notificationRow(_ notification: LinkNotification) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(notification.title.isEmpty ? notification.appName : notification.title)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    Spacer()
+                    Text(notification.postTime, style: .relative)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if !notification.text.isEmpty {
+                    Text(notification.text)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                if let status = model.replyStatuses[notification.id] {
+                    Text(status)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if notification.hasQuickReply {
+                    HStack(spacing: 6) {
+                        TextField(
+                            "Reply…",
+                            text: Binding(
+                                get: { model.replyDrafts[notification.id] ?? "" },
+                                set: { model.replyDrafts[notification.id] = $0 }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .onSubmit { model.sendReply(to: notification) }
+                        Button {
+                            model.sendReply(to: notification)
+                        } label: {
+                            Image(systemName: "paperplane.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!model.isReplyEnabled(for: notification))
+                    }
+                }
+                HStack(spacing: 10) {
+                    if !notification.text.isEmpty {
+                        Button("Copy text") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(notification.text, forType: .string)
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption2)
+                    }
+                    Button("Dismiss on phone") { model.dismissNotification(notification) }
+                        .buttonStyle(.borderless)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .disabled(!model.isConnected)
+                }
+            }
+        }
+    }
+
+    private var groupedNotifications: [(app: String, items: [LinkNotification])] {
+        let groups = Dictionary(grouping: model.notifications) { notification in
+            notification.appName.isEmpty ? notification.packageName : notification.appName
+        }
+        return groups
+            .map { (app: $0.key, items: $0.value.sorted { $0.postTime > $1.postTime }) }
+            .sorted { $0.items.first?.postTime ?? .distantPast > $1.items.first?.postTime ?? .distantPast }
     }
 
     @ViewBuilder
@@ -144,14 +219,51 @@ struct ConnectionStatusView: View {
 
     private var connectedControls: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let battery = model.phoneBattery {
+                HStack(spacing: 6) {
+                    Image(systemName: battery.symbolName)
+                        .foregroundStyle(.secondary)
+                    Text("Phone battery: \(battery.summaryText)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             HStack(spacing: 10) {
                 Button("Ping") { model.sendPing() }
                 Button("Disconnect") { model.disconnect() }
             }
             HStack(spacing: 10) {
                 Button("Send clipboard to phone") { model.sendClipboardToPhone() }
+                Toggle("Send on copy", isOn: Binding(
+                    get: { model.sendClipboardOnCopy },
+                    set: { model.setSendClipboardOnCopy($0) }
+                ))
+                .font(.caption)
+                .toggleStyle(.checkbox)
             }
             Button("Send file to phone…") { model.pickAndSendFile() }
+            Divider()
+            HStack(spacing: 10) {
+                Button(mirrorButtonLabel) { model.toggleMirroring() }
+                if !model.mirrorStatusText.isEmpty {
+                    Text(model.mirrorStatusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if model.mirrorPhase == .requesting {
+                Text("Approve the prompt on your phone to start mirroring.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var mirrorButtonLabel: String {
+        switch model.mirrorPhase {
+        case .idle: "Mirror phone screen"
+        case .requesting: "Cancel mirroring request"
+        case .active: "Stop mirroring"
         }
     }
 
@@ -327,6 +439,68 @@ struct ConnectionStatusView: View {
                 }
             }
         }
+    }
+
+    private var recentTransfersSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Divider()
+            HStack {
+                Text("Recent transfers")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Button("Clear") { model.clearTransferHistory() }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+            }
+            ForEach(model.transferHistory) { entry in
+                HStack(spacing: 8) {
+                    historyIcon(entry)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(entry.fileName)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Text(historyStatusText(entry))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func historyIcon(_ entry: TransferHistoryEntry) -> some View {
+        switch entry.state {
+        case .delivered, .completed:
+            Image(systemName: entry.direction == .send ? "arrow.up.circle.fill" : "arrow.down.circle.fill")
+                .foregroundStyle(.green)
+        case .mismatch, .failed:
+            Image(systemName: entry.direction == .send ? "arrow.up.circle.fill" : "arrow.down.circle.fill")
+                .foregroundStyle(.red)
+        case .cancelled:
+            Image(systemName: entry.direction == .send ? "arrow.up.circle" : "arrow.down.circle")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func historyStatusText(_ entry: TransferHistoryEntry) -> String {
+        let size = ByteCountFormatter.string(fromByteCount: entry.totalBytes, countStyle: .file)
+        let direction = entry.direction == .send ? "Sent" : "Received"
+        let outcome: String
+        switch entry.state {
+        case .delivered:
+            outcome = "\(direction) · \(size)"
+        case .completed:
+            outcome = "\(direction) · \(size)"
+        case .mismatch:
+            outcome = "\(direction) · checksum mismatch"
+        case .cancelled:
+            outcome = "\(direction) · cancelled"
+        case .failed(let reason):
+            outcome = "\(direction) · failed — \(reason)"
+        }
+        return "\(outcome) · \(entry.date.formatted(date: .abbreviated, time: .shortened))"
     }
 
     @ViewBuilder

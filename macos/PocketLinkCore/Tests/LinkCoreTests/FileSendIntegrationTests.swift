@@ -57,65 +57,27 @@ final class FileSenderTests: XCTestCase {
     }
 }
 
-final class FileReceiverStub: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "file-receiver-stub")
+final class FileReceiverStub: CryptoLoopbackServer, @unchecked Sendable {
     private let ackExpectation: XCTestExpectation
-    private var listener: NWListener?
-    private var connection: NWConnection?
-    private var decoder = FrameDecoder()
     private var received = Data()
     private var metadata: (fileId: String, size: Int64, sha256: String)?
-    private(set) var sentAckStatus: String?
-    private(set) var sentAckBytes: Int64 = -1
+    private var sentAckStatusValue: String?
+    private var sentAckBytesValue: Int64 = -1
 
     init(ackExpectation: XCTestExpectation) {
         self.ackExpectation = ackExpectation
+        try! super.init(label: "file-receiver-stub")
     }
 
-    func start() throws -> UInt16 {
-        let listener = try NWListener(using: .tcp)
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self else { return }
-            self.connection = connection
-            connection.start(queue: queue)
-            receiveLoop()
-        }
-        listener.start(queue: queue)
-        for _ in 0..<500 {
-            if let port = listener.port?.rawValue, port != 0 {
-                self.listener = listener
-                return port
-            }
-            usleep(10_000)
-        }
-        listener.cancel()
-        throw NSError(domain: "FileReceiverStub", code: 1, userInfo: [NSLocalizedDescriptionKey: "listener never bound"])
+    var sentAckStatus: String? {
+        queue.sync { sentAckStatusValue }
     }
 
-    func stop() {
-        connection?.cancel()
-        listener?.cancel()
+    var sentAckBytes: Int64 {
+        queue.sync { sentAckBytesValue }
     }
 
-    private func receiveLoop() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
-            guard let self else { return }
-            if let data {
-                do {
-                    for frame in try self.decoder.feed([UInt8](data)) {
-                        self.handle(frame)
-                    }
-                } catch {
-                    FileHandle.standardError.write(Data("receiver-stub decode error: \(error)\n".utf8))
-                }
-            }
-            if error == nil {
-                receiveLoop()
-            }
-        }
-    }
-
-    private func handle(_ frame: Frame) {
+    override func handlePlaintext(_ frame: Frame) {
         switch frame.messageType {
         case .fileHeader:
             guard
@@ -139,12 +101,12 @@ final class FileReceiverStub: @unchecked Sendable {
     private func finish(fileId: String, sha256: String) {
         let digest = SecurityHash.hex(received)
         let status: FileAckStatus = digest.caseInsensitiveCompare(sha256) == .orderedSame ? .success : .shaMismatch
-        sentAckStatus = status.rawValue
-        sentAckBytes = Int64(received.count)
-        guard let ackFrame = try? FileAck.frame(fileId: fileId, receivedBytes: sentAckBytes, status: status, streamId: 99) else {
+        sentAckStatusValue = status.rawValue
+        sentAckBytesValue = Int64(received.count)
+        guard let ackFrame = try? FileAck.frame(fileId: fileId, receivedBytes: sentAckBytesValue, status: status, streamId: 99) else {
             return
         }
-        connection?.send(content: Data(try! FrameEncoder.encode(ackFrame)), completion: .contentProcessed { _ in })
+        sealAndSend(ackFrame)
         ackExpectation.fulfill()
     }
 }
@@ -160,7 +122,7 @@ final class FileSendIntegrationTests: XCTestCase {
 
         let ackExpectation = expectation(description: "stub sent FILE_ACK")
         let server = FileReceiverStub(ackExpectation: ackExpectation)
-        let port = try server.start()
+        let port = try server.awaitBoundPort()
         defer { server.stop() }
 
         let client = LinkClient()
@@ -180,33 +142,13 @@ final class FileSendIntegrationTests: XCTestCase {
     }
 }
 
-final class SlowDrainStub: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "slow-drain-stub")
-    private let listener: NWListener
-    private var connection: NWConnection?
-    private var bytesDrained: Int = 0
+final class SlowDrainStub: CryptoLoopbackServer, @unchecked Sendable {
+    private var bytesDrained = 0
     private var timer: DispatchSourceTimer?
-    private var decoder = FrameDecoder()
     private var inboundFrames: [Frame] = []
 
     init() throws {
-        listener = try NWListener(using: .tcp)
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self else { return }
-            self.connection = connection
-            connection.start(queue: queue)
-            self.scheduleDrain()
-        }
-        listener.start(queue: queue)
-    }
-
-    func awaitBoundPort(timeout: TimeInterval = 5) throws -> UInt16 {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if let port = listener.port?.rawValue, port != 0 { return port }
-            usleep(10_000)
-        }
-        throw NSError(domain: "SlowDrainStub", code: 1, userInfo: [NSLocalizedDescriptionKey: "never bound"])
+        try! super.init(label: "slow-drain-stub")
     }
 
     var drainedBytes: Int {
@@ -217,7 +159,7 @@ final class SlowDrainStub: @unchecked Sendable {
         queue.sync { inboundFrames }
     }
 
-    func stop() {
+    override func stop() {
         queue.sync {
             timer?.cancel()
             connection?.cancel()
@@ -225,25 +167,26 @@ final class SlowDrainStub: @unchecked Sendable {
         }
     }
 
-    private func scheduleDrain() {
+    override func startReceiving(_ connection: NWConnection) {
+        scheduleDrain(connection)
+    }
+
+    override func consume(_ data: Data) {
+        bytesDrained += data.count
+        super.consume(data)
+    }
+
+    override func handlePlaintext(_ frame: Frame) {
+        inboundFrames.append(frame)
+    }
+
+    private func scheduleDrain(_ connection: NWConnection) {
         let source = DispatchSource.makeTimerSource(queue: queue)
         source.schedule(deadline: .now() + DispatchTimeInterval.milliseconds(50), repeating: .milliseconds(50))
         source.setEventHandler { [weak self] in
             guard let self, let connection = self.connection else { return }
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, _ in
-                guard let self, let data else { return }
-                self.queue.async {
-                    self.bytesDrained += data.count
-                    do {
-                        for frame in try self.decoder.feed([UInt8](data)) {
-                            self.inboundFrames.append(frame)
-                        }
-                    } catch {
-                        FileHandle.standardError.write(Data("slow-drain decode error: \(error)\n".utf8))
-                    }
-                }
-                self.scheduleDrain()
-            }
+            self.receiveOnce(connection)
+            self.scheduleDrain(connection)
         }
         source.resume()
         timer = source

@@ -1,4 +1,3 @@
-import Network
 import XCTest
 
 import LinkConnection
@@ -7,56 +6,27 @@ import LinkSecurity
 
 @testable import LinkFiles
 
-final class FileServerStub: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "file-server-stub")
+/// Loopback server that pushes a small file transfer (FILE_HEADER +
+/// FILE_CHUNK) as soon as the encrypted channel is up, then records the
+/// FILE_ACK it receives.
+final class FileServerStub: CryptoLoopbackServer, @unchecked Sendable {
     private let payload: Data
     private let fileId: String
     private let ackExpectation: XCTestExpectation
-    private var listener: NWListener?
-    private var connection: NWConnection?
-    private var decoder = FrameDecoder()
-    private(set) var receivedAck: (fileId: String, receivedBytes: Int64, status: String)?
+    private var receivedAckValue: (fileId: String, receivedBytes: Int64, status: String)?
 
     init(payload: Data, fileId: String, ackExpectation: XCTestExpectation) {
         self.payload = payload
         self.fileId = fileId
         self.ackExpectation = ackExpectation
+        try! super.init(label: "file-server-stub")
     }
 
-    func start() throws -> UInt16 {
-        let listener = try NWListener(using: .tcp)
-        listener.newConnectionHandler = { [weak self] connection in
-            self?.accept(connection)
-        }
-        listener.start(queue: queue)
-        for _ in 0..<500 {
-            if let port = listener.port?.rawValue, port != 0 {
-                self.listener = listener
-                return port
-            }
-            usleep(10_000)
-        }
-        listener.cancel()
-        throw NSError(domain: "FileServerStub", code: 1, userInfo: [NSLocalizedDescriptionKey: "listener never bound"])
+    var receivedAck: (fileId: String, receivedBytes: Int64, status: String)? {
+        queue.sync { receivedAckValue }
     }
 
-    func stop() {
-        connection?.cancel()
-        listener?.cancel()
-    }
-
-    private func accept(_ connection: NWConnection) {
-        self.connection = connection
-        connection.stateUpdateHandler = { [weak self] state in
-            if case .ready = state {
-                self?.sendTransfer()
-            }
-        }
-        connection.start(queue: queue)
-        receiveLoop()
-    }
-
-    private func sendTransfer() {
+    override func onChannelReady() {
         let header: [String: Any] = [
             "fileId": fileId,
             "name": "integration.txt",
@@ -65,39 +35,20 @@ final class FileServerStub: @unchecked Sendable {
             "mimeType": "text/plain"
         ]
         let headerData = try! JSONSerialization.data(withJSONObject: header)
-        send(Frame(messageType: .fileHeader, streamId: 1, payload: [UInt8](headerData)))
-        send(Frame(messageType: .fileChunk, streamId: 2, payload: FileChunk.headerBytes(fileIdHash: JavaStringHash.hash(fileId), offset: 0) + [UInt8](payload)))
+        sealAndSend(Frame(messageType: .fileHeader, streamId: 1, payload: [UInt8](headerData)))
+        sealAndSend(
+            Frame(
+                messageType: .fileChunk,
+                streamId: 2,
+                payload: FileChunk.headerBytes(fileIdHash: JavaStringHash.hash(fileId), offset: 0) + [UInt8](payload)
+            )
+        )
     }
 
-    private func send(_ frame: Frame) {
-        guard let connection else { return }
-        let data = Data(try! FrameEncoder.encode(frame))
-        connection.send(content: data, completion: .contentProcessed { error in
-            if let error {
-                FileHandle.standardError.write(Data("stub send error: \(error)\n".utf8))
-            }
-        })
-    }
-
-    private func receiveLoop() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
-            guard let self else { return }
-            if let data {
-                do {
-                    for frame in try self.decoder.feed([UInt8](data)) {
-                        if frame.messageType == .fileAck, let ack = FileAck.parse(frame) {
-                            receivedAck = (fileId: ack.fileId, receivedBytes: ack.receivedBytes, status: ack.status.rawValue)
-                            ackExpectation.fulfill()
-                        }
-                    }
-                } catch {
-                    FileHandle.standardError.write(Data("stub decode error: \(error)\n".utf8))
-                }
-            }
-            if error == nil {
-                receiveLoop()
-            }
-        }
+    override func handlePlaintext(_ frame: Frame) {
+        guard frame.messageType == .fileAck, let ack = FileAck.parse(frame) else { return }
+        receivedAckValue = (fileId: ack.fileId, receivedBytes: ack.receivedBytes, status: ack.status.rawValue)
+        ackExpectation.fulfill()
     }
 }
 
@@ -107,7 +58,7 @@ final class FileTransferIntegrationTests: XCTestCase {
         let payload = Data("hello integration world".utf8)
         let ackExpectation = expectation(description: "server received FILE_ACK")
         let server = FileServerStub(payload: payload, fileId: "abc12345", ackExpectation: ackExpectation)
-        let port = try server.start()
+        let port = try server.awaitBoundPort()
         defer { server.stop() }
 
         let client = LinkClient()
@@ -122,11 +73,12 @@ final class FileTransferIntegrationTests: XCTestCase {
             switch frame.messageType {
             case .fileHeader:
                 if let metadata = FileMetadata.parse(frame) {
-                    _ = try receiver.begin(metadata, in: directory)
+                    _ = try await receiver.begin(metadata, in: directory)
                 }
             case .fileChunk:
                 guard let chunk = FileChunk.parse(frame) else { continue }
-                guard case .finished(let progress, let ack) = try XCTUnwrap(receiver.append(chunk)) else { continue }
+                let appended = try await receiver.append(chunk)
+                guard case .finished(let progress, let ack) = try XCTUnwrap(appended) else { continue }
                 try await client.send(
                     FileAck.frame(
                         fileId: progress.metadata.fileId,

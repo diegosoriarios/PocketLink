@@ -87,20 +87,20 @@ class LinkNotificationListenerService : NotificationListenerService() {
         return false
     }
 
-    fun handleReply(id: String, text: String) {
+    fun handleReply(id: String, text: String): Boolean {
         val sbn = activeNotifications?.firstOrNull { "${it.key}_${it.postTime}" == id }
         if (sbn == null) {
             Log.w(TAG, "Quick reply: no matching notification for id $id")
-            return
+            return false
         }
 
         val action = sbn.notification.actions?.firstOrNull { !it.remoteInputs.isNullOrEmpty() }
         if (action == null || action.actionIntent == null) {
             Log.w(TAG, "Quick reply: no reply action on notification ${sbn.id} (${sbn.packageName})")
-            return
+            return false
         }
 
-        val remoteInputs = action.remoteInputs ?: return
+        val remoteInputs = action.remoteInputs ?: return false
         val intent = Intent().apply {
             clipData = ClipData.newPlainText("reply", "reply")
         }
@@ -110,13 +110,32 @@ class LinkNotificationListenerService : NotificationListenerService() {
             bundleOf(remoteInputs[0].resultKey to text)
         )
 
-        try {
+        return try {
             action.actionIntent.send(applicationContext, 0, intent)
             Log.d(TAG, "Quick reply delivered to ${sbn.packageName} (notification id ${sbn.id})")
+            true
         } catch (e: PendingIntent.CanceledException) {
             Log.w(TAG, "Quick reply failed for ${sbn.packageName} (notification id ${sbn.id}): action canceled")
+            false
         } catch (e: Exception) {
             Log.w(TAG, "Quick reply failed for ${sbn.packageName} (notification id ${sbn.id}): ${e.message}")
+            false
+        }
+    }
+
+    fun handleDismiss(id: String): Boolean {
+        val sbn = activeNotifications?.firstOrNull { "${it.key}_${it.postTime}" == id }
+        if (sbn == null) {
+            Log.w(TAG, "Dismiss: no matching notification for id $id")
+            return false
+        }
+        return try {
+            cancelNotification(sbn.key)
+            Log.d(TAG, "Dismissed notification ${sbn.id} (${sbn.packageName})")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Dismiss failed for ${sbn.packageName} (notification id ${sbn.id}): ${e.message}")
+            false
         }
     }
 

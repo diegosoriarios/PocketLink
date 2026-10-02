@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">PocketLink</string>
+    <string name="accessibility_service_description">Required for screen mirroring remote control. When enabled, PocketLink can inject taps and swipes on your behalf while your screen is mirrored to a trusted Mac.</string>
 </resources>

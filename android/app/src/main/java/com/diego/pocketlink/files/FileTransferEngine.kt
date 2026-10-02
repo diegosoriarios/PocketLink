@@ -6,10 +6,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,12 +27,19 @@ import java.util.UUID
 class FileTransferEngine(
     private val context: Context,
     private val scope: CoroutineScope,
+    private val historyStore: TransferHistoryStore? = null,
     private val onSendFrame: (typeId: Int, payload: ByteArray) -> Boolean
 ) {
-    private val _transferProgress = MutableStateFlow<TransferProgress?>(null)
-    val transferProgress: StateFlow<TransferProgress?> = _transferProgress.asStateFlow()
+    private val _sendProgress = MutableStateFlow<TransferProgress?>(null)
+    val sendProgress: StateFlow<TransferProgress?> = _sendProgress.asStateFlow()
+
+    private val _receiveProgress = MutableStateFlow<TransferProgress?>(null)
+    val receiveProgress: StateFlow<TransferProgress?> = _receiveProgress.asStateFlow()
 
     private var activeJob: Job? = null
+    private var sendClearJob: Job? = null
+    private var receiveClearJob: Job? = null
+    private var sendAckTimeoutJob: Job? = null
     @Volatile
     private var isCancelled: Boolean = false
 
@@ -42,31 +51,121 @@ class FileTransferEngine(
     private var incomingUri: Uri? = null
     private var incomingFile: File? = null
 
+    private fun flowFor(direction: TransferDirection): MutableStateFlow<TransferProgress?> = when (direction) {
+        TransferDirection.SEND -> _sendProgress
+        TransferDirection.RECEIVE -> _receiveProgress
+    }
+
+    private fun emit(progress: TransferProgress) {
+        val flow = flowFor(progress.direction)
+        if (progress.state.isTerminal) {
+            recordHistory(progress)
+        }
+        setClearJob(progress.direction, null)
+        flow.value = progress
+        setClearJob(progress.direction, scheduleAutoClear(progress.direction))
+    }
+
+    private fun recordHistory(progress: TransferProgress) {
+        historyStore?.record(
+            TransferHistoryEntry(
+                fileId = progress.fileId,
+                direction = progress.direction,
+                fileName = progress.fileName,
+                totalBytes = progress.totalBytes,
+                state = progress.state,
+                errorMessage = progress.errorMessage
+            )
+        )
+    }
+
+    private fun update(direction: TransferDirection, transform: (TransferProgress) -> TransferProgress) {
+        flowFor(direction).value?.let { emit(transform(it)) }
+    }
+
+    private fun setClearJob(direction: TransferDirection, job: Job?) {
+        when (direction) {
+            TransferDirection.SEND -> sendClearJob = job
+            TransferDirection.RECEIVE -> receiveClearJob = job
+        }
+    }
+
+    private fun scheduleAutoClear(direction: TransferDirection): Job? {
+        if (flowFor(direction).value?.state?.isTerminal != true) return null
+        return scope.launch {
+            delay(AUTO_CLEAR_DELAY_MS)
+            val flow = flowFor(direction)
+            if (flow.value?.state?.isTerminal == true) {
+                flow.value = null
+            }
+        }
+    }
+
+    fun dismissResult(direction: TransferDirection) {
+        val flow = flowFor(direction)
+        val progress = flow.value ?: return
+        if (!progress.state.isTerminal) return
+        setClearJob(direction, null)
+        flow.value = null
+    }
+
+    fun handleFileAck(fileId: String, status: String) {
+        val target = TransferState.ackStateFor(status) ?: return
+        val progress = _sendProgress.value ?: return
+        if (progress.direction != TransferDirection.SEND || progress.fileId != fileId) return
+        if (progress.state != TransferState.VERIFYING) return
+        sendAckTimeoutJob?.cancel()
+        sendAckTimeoutJob = null
+        emit(
+            progress.copy(
+                state = target,
+                errorMessage = if (target == TransferState.MISMATCH) "Receiver reported SHA-256 mismatch" else null
+            )
+        )
+        Log.d(TAG, "Send ACK processed for $fileId -> $target")
+    }
+
     fun sendFile(uri: Uri) {
-        if (_transferProgress.value?.state == TransferState.IN_PROGRESS) {
-            Log.w(TAG, "File transfer already in progress")
+        val sendState = _sendProgress.value?.state
+        if (sendState == TransferState.IN_PROGRESS || sendState == TransferState.VERIFYING) {
+            Log.w(TAG, "File send already in progress")
             return
         }
 
         isCancelled = false
+        sendAckTimeoutJob?.cancel()
+        sendAckTimeoutJob = null
         activeJob = scope.launch(Dispatchers.IO) {
             try {
                 val contentResolver = context.contentResolver
                 val fileName = getFileNameFromUri(uri) ?: "transfer_${System.currentTimeMillis()}"
                 val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
 
-                _transferProgress.value = TransferProgress(
-                    fileId = "",
-                    fileName = fileName,
-                    bytesTransferred = 0L,
-                    totalBytes = 0L,
-                    state = TransferState.IN_PROGRESS
+                emit(
+                    TransferProgress(
+                        fileId = "",
+                        fileName = fileName,
+                        bytesTransferred = 0L,
+                        totalBytes = 0L,
+                        state = TransferState.IN_PROGRESS,
+                        direction = TransferDirection.SEND
+                    )
                 )
 
-                // 1. Calculate file size and SHA-256
+                // 1. Calculate file size and SHA-256 (count bytes while hashing; available() is unreliable)
                 Log.d(TAG, "Calculating file SHA-256 checksum...")
-                val fileSize = contentResolver.openInputStream(uri)?.use { it.available().toLong() } ?: 0L
-                val sha256 = contentResolver.openInputStream(uri)?.use { ChecksumUtils.calculateSha256(it) } ?: ""
+                val hashBuffer = ByteArray(SIZE_READ_BUFFER_SIZE)
+                var countedSize = 0L
+                val sha256 = contentResolver.openInputStream(uri)?.use { stream ->
+                    val digest = MessageDigest.getInstance("SHA-256")
+                    var read: Int
+                    while (stream.read(hashBuffer).also { read = it } != -1) {
+                        digest.update(hashBuffer, 0, read)
+                        countedSize += read
+                    }
+                    digest.digest().joinToString("") { "%02x".format(it) }
+                } ?: ""
+                val fileSize = queryFileSize(uri) ?: countedSize
 
                 val fileId = UUID.randomUUID().toString().take(8)
                 val metadata = FileMetadata(
@@ -77,12 +176,15 @@ class FileTransferEngine(
                     mimeType = mimeType
                 )
 
-                _transferProgress.value = TransferProgress(
-                    fileId = fileId,
-                    fileName = fileName,
-                    bytesTransferred = 0L,
-                    totalBytes = fileSize,
-                    state = TransferState.IN_PROGRESS
+                emit(
+                    TransferProgress(
+                        fileId = fileId,
+                        fileName = fileName,
+                        bytesTransferred = 0L,
+                        totalBytes = fileSize,
+                        state = TransferState.IN_PROGRESS,
+                        direction = TransferDirection.SEND
+                    )
                 )
 
                 // 2. Send FILE_HEADER (0x0040)
@@ -110,7 +212,7 @@ class FileTransferEngine(
                     while (stream.read(chunkBuffer).also { bytesRead = it } != -1) {
                         if (isCancelled) {
                             sendAck(fileId, bytesSent, "CANCELLED")
-                            _transferProgress.value = _transferProgress.value?.copy(state = TransferState.CANCELLED)
+                            update(TransferDirection.SEND) { it.copy(state = TransferState.CANCELLED) }
                             Log.d(TAG, "File upload cancelled by user")
                             return@launch
                         }
@@ -123,17 +225,43 @@ class FileTransferEngine(
                         }
 
                         bytesSent += bytesRead
-                        _transferProgress.value = _transferProgress.value?.copy(bytesTransferred = bytesSent)
+                        update(TransferDirection.SEND) { it.copy(bytesTransferred = bytesSent) }
                     }
                 }
 
-                _transferProgress.value = _transferProgress.value?.copy(state = TransferState.COMPLETED)
-                Log.d(TAG, "File sent successfully ($bytesSent bytes)")
+                if (isCancelled) {
+                    update(TransferDirection.SEND) { it.copy(state = TransferState.CANCELLED) }
+                    return@launch
+                }
+
+                // 4. Chunks delivered; the receiver still has to verify SHA-256 and ACK
+                update(TransferDirection.SEND) { it.copy(state = TransferState.VERIFYING, bytesTransferred = bytesSent) }
+                scheduleAckTimeout(fileId)
+                Log.d(TAG, "File sent ($bytesSent bytes); awaiting receiver ACK")
             } catch (e: Exception) {
                 Log.e(TAG, "File transfer failed: ${e.message}")
-                _transferProgress.value = _transferProgress.value?.copy(
-                    state = TransferState.FAILED,
-                    errorMessage = e.message
+                update(TransferDirection.SEND) {
+                    it.copy(
+                        state = TransferState.FAILED,
+                        errorMessage = e.message
+                    )
+                }
+            }
+        }
+    }
+
+    private fun scheduleAckTimeout(fileId: String) {
+        sendAckTimeoutJob?.cancel()
+        sendAckTimeoutJob = scope.launch {
+            delay(ACK_TIMEOUT_MS)
+            val current = _sendProgress.value
+            if (current?.state == TransferState.VERIFYING && current.fileId == fileId) {
+                Log.w(TAG, "No FILE_ACK received for $fileId; marking send as failed")
+                emit(
+                    current.copy(
+                        state = TransferState.FAILED,
+                        errorMessage = "No confirmation from receiver"
+                    )
                 )
             }
         }
@@ -176,34 +304,43 @@ class FileTransferEngine(
                 if (calculatedSha.equals(metadata.sha256, ignoreCase = true)) {
                     Log.d(TAG, "Zero-size file completed and SHA-256 verified successfully!")
                     sendAck(metadata.fileId, 0L, "SUCCESS")
-                    _transferProgress.value = TransferProgress(
-                        fileId = metadata.fileId,
-                        fileName = metadata.name,
-                        bytesTransferred = 0L,
-                        totalBytes = 0L,
-                        state = TransferState.COMPLETED
+                    emit(
+                        TransferProgress(
+                            fileId = metadata.fileId,
+                            fileName = metadata.name,
+                            bytesTransferred = 0L,
+                            totalBytes = 0L,
+                            state = TransferState.COMPLETED,
+                            direction = TransferDirection.RECEIVE
+                        )
                     )
                 } else {
                     Log.e(TAG, "SHA-256 mismatch! Expected ${metadata.sha256}, calculated $calculatedSha")
                     sendAck(metadata.fileId, 0L, "SHA_MISMATCH")
-                    _transferProgress.value = TransferProgress(
-                        fileId = metadata.fileId,
-                        fileName = metadata.name,
-                        bytesTransferred = 0L,
-                        totalBytes = 0L,
-                        state = TransferState.FAILED,
-                        errorMessage = "SHA-256 Checksum Verification Failed"
+                    emit(
+                        TransferProgress(
+                            fileId = metadata.fileId,
+                            fileName = metadata.name,
+                            bytesTransferred = 0L,
+                            totalBytes = 0L,
+                            state = TransferState.FAILED,
+                            direction = TransferDirection.RECEIVE,
+                            errorMessage = "SHA-256 Checksum Verification Failed"
+                        )
                     )
                 }
                 return@withContext
             }
 
-            _transferProgress.value = TransferProgress(
-                fileId = metadata.fileId,
-                fileName = metadata.name,
-                bytesTransferred = 0L,
-                totalBytes = metadata.size,
-                state = TransferState.IN_PROGRESS
+            emit(
+                TransferProgress(
+                    fileId = metadata.fileId,
+                    fileName = metadata.name,
+                    bytesTransferred = 0L,
+                    totalBytes = metadata.size,
+                    state = TransferState.IN_PROGRESS,
+                    direction = TransferDirection.RECEIVE
+                )
             )
             Log.d(TAG, "Receiving incoming file: ${metadata.name} (${metadata.size} bytes)")
         } catch (e: Exception) {
@@ -223,7 +360,7 @@ class FileTransferEngine(
             incomingDigest?.update(chunkData)
             incomingBytesReceived += chunkData.size
 
-            _transferProgress.value = _transferProgress.value?.copy(bytesTransferred = incomingBytesReceived)
+            update(TransferDirection.RECEIVE) { it.copy(bytesTransferred = incomingBytesReceived) }
 
             // On completion, verify SHA-256
             if (incomingBytesReceived >= metadata.size) {
@@ -237,22 +374,26 @@ class FileTransferEngine(
                 if (calculatedSha.equals(metadata.sha256, ignoreCase = true)) {
                     Log.d(TAG, "File download completed and SHA-256 verified successfully!")
                     sendAck(metadata.fileId, incomingBytesReceived, "SUCCESS")
-                    _transferProgress.value = _transferProgress.value?.copy(state = TransferState.COMPLETED)
+                    update(TransferDirection.RECEIVE) { it.copy(state = TransferState.COMPLETED) }
                 } else {
                     Log.e(TAG, "SHA-256 mismatch! Expected ${metadata.sha256}, calculated $calculatedSha")
                     sendAck(metadata.fileId, incomingBytesReceived, "SHA_MISMATCH")
-                    _transferProgress.value = _transferProgress.value?.copy(
-                        state = TransferState.FAILED,
-                        errorMessage = "SHA-256 Checksum Verification Failed"
-                    )
+                    update(TransferDirection.RECEIVE) {
+                        it.copy(
+                            state = TransferState.FAILED,
+                            errorMessage = "SHA-256 Checksum Verification Failed"
+                        )
+                    }
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error writing incoming chunk: ${e.message}")
-            _transferProgress.value = _transferProgress.value?.copy(
-                state = TransferState.FAILED,
-                errorMessage = e.message
-            )
+            update(TransferDirection.RECEIVE) {
+                it.copy(
+                    state = TransferState.FAILED,
+                    errorMessage = e.message
+                )
+            }
         }
     }
 
@@ -280,20 +421,45 @@ class FileTransferEngine(
 
         val bytesReceived = incomingBytesReceived
         discardIncomingPartial()
-        _transferProgress.value = TransferProgress(
-            fileId = metadata.fileId,
-            fileName = metadata.name,
-            bytesTransferred = bytesReceived,
-            totalBytes = metadata.size,
-            state = TransferState.CANCELLED
+        emit(
+            TransferProgress(
+                fileId = metadata.fileId,
+                fileName = metadata.name,
+                bytesTransferred = bytesReceived,
+                totalBytes = metadata.size,
+                state = TransferState.CANCELLED,
+                direction = TransferDirection.RECEIVE
+            )
         )
         Log.d(TAG, "Incoming transfer cancelled by sender (fileId=$fileId, received $bytesReceived bytes)")
     }
 
-    fun cancelTransfer() {
+    fun cancelSendTransfer() {
+        val progress = _sendProgress.value ?: return
+        if (progress.state != TransferState.IN_PROGRESS) return
         isCancelled = true
         activeJob?.cancel()
-        _transferProgress.value = _transferProgress.value?.copy(state = TransferState.CANCELLED)
+        emit(progress.copy(state = TransferState.CANCELLED))
+        Log.d(TAG, "Outgoing transfer cancelled by user")
+    }
+
+    fun cancelReceiveTransfer() {
+        val progress = _receiveProgress.value ?: return
+        if (progress.state != TransferState.IN_PROGRESS) return
+        val metadata = incomingMetadata
+        val bytesReceived = incomingBytesReceived
+        discardIncomingPartial()
+        emit(
+            TransferProgress(
+                fileId = metadata?.fileId ?: progress.fileId,
+                fileName = metadata?.name ?: progress.fileName,
+                bytesTransferred = bytesReceived,
+                totalBytes = metadata?.size ?: progress.totalBytes,
+                state = TransferState.CANCELLED,
+                direction = TransferDirection.RECEIVE
+            )
+        )
+        Log.d(TAG, "Incoming transfer cancelled by user (fileId=${metadata?.fileId ?: "unknown"})")
     }
 
     private fun discardIncomingPartial() {
@@ -338,6 +504,23 @@ class FileTransferEngine(
         onSendFrame(0x0042, ackJson)
     }
 
+    private fun queryFileSize(uri: Uri): Long? {
+        return try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (sizeIndex != -1 && cursor.moveToFirst() && !cursor.isNull(sizeIndex)) {
+                    val size = cursor.getLong(sizeIndex)
+                    if (size >= 0) size else null
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query file size: ${e.message}")
+            null
+        }
+    }
+
     private fun createMediaStoreOutputStream(fileName: String, mimeType: String): OutputStream {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val contentValues = ContentValues().apply {
@@ -375,5 +558,8 @@ class FileTransferEngine(
 
     companion object {
         private const val TAG = "FileTransferEngine"
+        private const val AUTO_CLEAR_DELAY_MS = 6_000L
+        private const val ACK_TIMEOUT_MS = 30_000L
+        private const val SIZE_READ_BUFFER_SIZE = 64 * 1024
     }
 }

@@ -84,4 +84,84 @@ final class LinkNotificationTests: XCTestCase {
         XCTAssertThrowsError(try NotificationReply.frame(id: "pkg_1_2", text: "   ", streamId: 1))
         XCTAssertThrowsError(try NotificationReply.frame(id: "", text: "hi", streamId: 1))
     }
+
+    func testNotificationActionFrameRoundTrip() throws {
+        let frame = try NotificationAction.frame(id: "pkg_1_2", action: NotificationAction.dismiss, streamId: 4)
+        XCTAssertEqual(frame.messageType, .notificationAction)
+        XCTAssertEqual(frame.streamId, 4)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(frame.payload)) as? [String: Any])
+        XCTAssertEqual(object["id"] as? String, "pkg_1_2")
+        XCTAssertEqual(object["action"] as? String, "dismiss")
+    }
+
+    func testNotificationActionRejectsEmptyFields() {
+        XCTAssertThrowsError(try NotificationAction.frame(id: "", action: "dismiss", streamId: 1))
+        XCTAssertThrowsError(try NotificationAction.frame(id: "x", action: "", streamId: 1))
+    }
+
+    func testReplyAckParse() {
+        let frame = Frame(
+            messageType: .notificationReplyAck,
+            streamId: 2,
+            payload: [UInt8](#"{"id":"pkg_1_2","success":true}"#.utf8)
+        )
+        let ack = NotificationReplyAck.parse(frame)
+        XCTAssertEqual(ack?.id, "pkg_1_2")
+        XCTAssertEqual(ack?.success, true)
+
+        let failure = NotificationReplyAck.parse(
+            Frame(
+                messageType: .notificationReplyAck,
+                streamId: 2,
+                payload: [UInt8](#"{"id":"pkg_1_2","success":false}"#.utf8)
+            )
+        )
+        XCTAssertEqual(failure?.success, false)
+
+        XCTAssertNil(NotificationReplyAck.parse(payload(#"{"id":"x"}"#)))
+        XCTAssertNil(NotificationReplyAck.parse(Frame(messageType: .ping, streamId: 0, payload: [UInt8](#"{"id":"x","success":true}"#.utf8))))
+    }
+}
+
+final class NotificationStoreTests: XCTestCase {
+    private func tempDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("notification-store-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    private func notification(id: String, postTime: Date = Date()) -> LinkNotification {
+        LinkNotification(
+            id: id, packageName: "com.test", appName: "Test",
+            title: "t", text: "b", postTime: postTime, hasQuickReply: false
+        )
+    }
+
+    func testRecordDeduplicatesAndCapsSize() async throws {
+        let store = NotificationStore(directory: try tempDirectory(), maxEntries: 3)
+        await store.record(notification(id: "1"))
+        await store.record(notification(id: "2"))
+        await store.record(notification(id: "3"))
+        await store.record(notification(id: "2"))
+        await store.record(notification(id: "4"))
+
+        let entries = await store.all()
+        XCTAssertEqual(entries.map(\.id), ["4", "2", "3"], "Newest first, deduped, capped at maxEntries")
+    }
+
+    func testPersistsAcrossInstancesAndClears() async throws {
+        let directory = try tempDirectory()
+        let store = NotificationStore(directory: directory)
+        await store.record(notification(id: "persist-1"))
+
+        let reloaded = NotificationStore(directory: directory)
+        let entries = await reloaded.all()
+        XCTAssertEqual(entries.map(\.id), ["persist-1"])
+
+        await reloaded.clear()
+        let cleared = NotificationStore(directory: directory)
+        let empty = await cleared.all()
+        XCTAssertTrue(empty.isEmpty)
+    }
 }

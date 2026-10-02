@@ -7,6 +7,36 @@ public enum FileReceiverError: Error, Equatable {
     case noActiveTransfer
 }
 
+/// Serial background writer owning the file handle, hash and byte count so
+/// chunk writes never block the main actor. Created and observed from
+/// `FileReceiver`, which funnels all access through a single sequential
+/// await chain (frames are processed one at a time, preserving byte order).
+private actor FileWriteWorker {
+    private let handle: FileHandle
+    private var hasher = IncrementalHash()
+    private var receivedBytes: Int64 = 0
+
+    init(handle: FileHandle) {
+        self.handle = handle
+    }
+
+    func append(_ data: Data) throws {
+        guard !data.isEmpty else { return }
+        try handle.write(contentsOf: data)
+        hasher.update(data)
+        receivedBytes += Int64(data.count)
+    }
+
+    func finish() -> (digest: String, receivedBytes: Int64) {
+        try? handle.close()
+        return (hasher.finalizeHex(), receivedBytes)
+    }
+
+    func close() {
+        try? handle.close()
+    }
+}
+
 @MainActor
 public final class FileReceiver {
     public struct Progress: Identifiable, Sendable, Equatable {
@@ -29,8 +59,7 @@ public final class FileReceiver {
 
     private var metadata: FileMetadata?
     private var fileURL: URL?
-    private var handle: FileHandle?
-    private var hasher = IncrementalHash()
+    private var worker: FileWriteWorker?
     private var receivedBytes: Int64 = 0
     private var finishedAck: FileAckStatus = .success
 
@@ -51,8 +80,8 @@ public final class FileReceiver {
         directory.appendingPathComponent(sanitizedFileName(for: metadata))
     }
 
-    public func begin(_ metadata: FileMetadata, in directory: URL) throws -> Progress {
-        abandon()
+    public func begin(_ metadata: FileMetadata, in directory: URL) async throws -> Progress {
+        await abandon()
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let url = Self.fileURL(for: metadata, in: directory)
@@ -66,37 +95,33 @@ public final class FileReceiver {
 
         self.metadata = metadata
         fileURL = url
-        handle = newHandle
-        hasher = IncrementalHash()
+        worker = FileWriteWorker(handle: newHandle)
         receivedBytes = 0
         finishedAck = .success
 
         if metadata.size <= 0 {
-            return try finalize()
+            return try await finalize()
         }
         return Progress(metadata: metadata, receivedBytes: 0, state: .receiving)
     }
 
-    public func append(_ chunk: FileChunk) throws -> AppendOutcome? {
-        guard let active = metadata, let openHandle = handle else { return nil }
+    public func append(_ chunk: FileChunk) async throws -> AppendOutcome? {
+        guard let active = metadata, let writeWorker = worker else { return nil }
         let data = chunk.data
-        if !data.isEmpty {
-            try openHandle.write(contentsOf: data)
-            hasher.update(data)
-        }
+        try await writeWorker.append(data)
         receivedBytes += Int64(data.count)
 
         if receivedBytes >= active.size {
-            return .finished(try finalize(), ack: finishedAck)
+            return .finished(try await finalize(), ack: finishedAck)
         }
         return .receiving(Progress(metadata: active, receivedBytes: receivedBytes, state: .receiving))
     }
 
-    public func abandon() {
-        if let openHandle = handle {
-            try? openHandle.close()
+    public func abandon() async {
+        if let writeWorker = worker {
+            await writeWorker.close()
         }
-        handle = nil
+        worker = nil
         if let url = fileURL {
             try? FileManager.default.removeItem(at: url)
         }
@@ -104,25 +129,23 @@ public final class FileReceiver {
         metadata = nil
     }
 
-    private func finalize() throws -> Progress {
-        guard let active = metadata, let url = fileURL else {
+    private func finalize() async throws -> Progress {
+        guard let active = metadata, let url = fileURL, let writeWorker = worker else {
             throw FileReceiverError.noActiveTransfer
         }
-        if let openHandle = handle {
-            try? openHandle.close()
-        }
-        handle = nil
-        let digest = hasher.finalizeHex()
+        let result = await writeWorker.finish()
+        worker = nil
 
         metadata = nil
         fileURL = nil
+        receivedBytes = result.receivedBytes
 
-        if digest.caseInsensitiveCompare(active.sha256) == .orderedSame {
+        if result.digest.caseInsensitiveCompare(active.sha256) == .orderedSame {
             finishedAck = .success
-            return Progress(metadata: active, receivedBytes: receivedBytes, state: .completed)
+            return Progress(metadata: active, receivedBytes: result.receivedBytes, state: .completed)
         }
         try? FileManager.default.removeItem(at: url)
         finishedAck = .shaMismatch
-        return Progress(metadata: active, receivedBytes: receivedBytes, state: .failed("SHA-256 mismatch"))
+        return Progress(metadata: active, receivedBytes: result.receivedBytes, state: .failed("SHA-256 mismatch"))
     }
 }
