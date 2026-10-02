@@ -13,16 +13,15 @@ This is a monorepo containing both clients:
 |---|---|---|
 | [`macos/`](macos/) | macOS menu-bar client | Swift 6 (strict concurrency), SwiftUI + AppKit, Network.framework, CryptoKit — macOS 14+ |
 | [`android/`](android/) | Android client | Kotlin, Jetpack Compose + Material 3, Gradle Kotlin DSL |
-| `planning.md` | Full engineering plan and roadmap | |
-| `next-steps.md` | Current status, known limitations, prioritized next work | |
+| [`PLAN.md`](PLAN.md) | Master plan: status, roadmap, known gaps, pitfalls | |
 
 ## Features
 
 - **Discovery & pairing** — Bonjour/mDNS (`_linkmymac._tcp`) discovery with QR-based pairing and a trust store
 - **Notifications** — phone notifications mirrored to native Mac notifications, with quick replies that dispatch back to the phone
 - **Clipboard sync** — text clipboard between devices (explicit send on the Mac, auto-send on the phone)
-- **File transfer** — chunked, SHA-256-verified transfers in both directions, including drag-and-drop on macOS
-- **Resilience** — heartbeats, auto-reconnect with capped backoff, foreground service + Wi-Fi lock on Android
+- **File transfer** — chunked, SHA-256-verified transfers in both directions, including drag-and-drop on macOS, an Android share-sheet target, concurrent send + receive, persisted recent-transfer history, and ACK timeouts
+- **Resilience** — automatic heartbeats on both platforms, auto-reconnect with capped backoff, foreground service + Wi-Fi lock + battery-optimization whitelist on Android
 
 The wire protocol (binary framing with magic bytes, message types, and stream IDs
 for multiplexing) is shared by both apps and documented in

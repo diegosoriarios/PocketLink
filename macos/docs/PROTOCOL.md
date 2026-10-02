@@ -37,28 +37,51 @@ as they complete. Validation happens in this order per attempt:
 
 Connection policy (as implemented on Android):
 - invalid frame → send ERROR 400, **close connection**
-- oversized frame → send ERROR 413, keep connection
-- unknown type → send ERROR 400, keep connection
+ - oversized frame → send ERROR 413, keep connection
+ - unknown type → send ERROR 400, keep connection
+ - header version != 1 → send ERROR 409, close connection
 
 ## Message types
 
 | ID       | Name        | Payload format |
 |----------|-------------|----------------|
-| `0x0001` | HANDSHAKE   | UTF-8 JSON: `{"device": "<str>", "platform": "<str>", "pairingToken": "<str, optional>"}` (see QR pairing below) |
+| `0x0001` | HANDSHAKE   | UTF-8 JSON: `{"device": "<str>", "platform": "<str>", "pairingToken": "<str, optional>", "protocolVersion": <int>}` (see QR pairing below) |
 | `0x0002` | PING        | UTF-8 JSON: `{"timestamp": <epoch ms>}` |
 | `0x0003` | PONG        | Verbatim echo of PING payload; streamId copied from PING |
 | `0x0004` | DEVICE_INFO | Defined, unused by Android |
-| `0x0005` | ERROR       | UTF-8 JSON: `{"code": <int>, "message": "<str>"}`, streamId 0; codes: 400, 413 |
+| `0x0005` | ERROR       | UTF-8 JSON: `{"code": <int>, "message": "<str>"}`, streamId 0; codes: 400, 401, 403, 409, 413 |
 | `0x0010` | CLIPBOARD   | UTF-8 JSON: `{"text": "<str>", "timestamp": <epoch ms>}` |
+| `0x0011` | CLIPBOARD_ACK | UTF-8 JSON: `{"timestamp": <epoch ms of acknowledged CLIPBOARD>}`. Sent by the receiver after applying clipboard text; lets the sender show delivery status. |
 | `0x0020` | BATTERY     | UTF-8 JSON: `{"level": <int 0-100>, "isCharging": <bool>, "powerSave": <bool>, "timestamp": <epoch ms>}` |
 | `0x0030` | NOTIFICATION | UTF-8 JSON: `{"id": "<str>", "packageName": "<str>", "appName": "<str>", "title": "<str>", "text": "<str>", "postTime": <epoch ms>, "hasQuickReply": <bool>}` |
 | `0x0031` | NOTIFICATION_REPLY | UTF-8 JSON: `{"id": "<str>", "text": "<str>"}`, streamId = sender counter (Mac→phone, see below) |
+| `0x0032` | NOTIFICATION_ACTION | UTF-8 JSON: `{"id": "<str>", "action": "<str>"}` (Mac→phone; `"dismiss"` cancels the notification on the phone) |
+| `0x0033` | NOTIFICATION_REPLY_ACK | UTF-8 JSON: `{"id": "<str>", "success": <bool>}` (phone→Mac; delivery confirmation for NOTIFICATION_REPLY) |
 | `0x0040` | FILE_HEADER | UTF-8 JSON: `{"fileId": "<8-char id>", "name": "<str>", "size": <int>, "sha256": "<64 lowercase hex>", "mimeType": "<str>"}` |
 | `0x0041` | FILE_CHUNK  | Binary: `int32 BE fileIdHash` + `int64 BE offset` + raw file bytes |
 | `0x0042` | FILE_ACK    | UTF-8 JSON: `{"fileId": "<id>", "receivedBytes": <int>, "status": "<str>"}`; status: `SUCCESS`, `SHA_MISMATCH`, `CANCELLED` |
 | `0x0043` | FILE_CANCEL | UTF-8 JSON: `{"fileId": "<8-char id>"}`, streamId 0. Sender→receiver abort of the active transfer with that `fileId` (extension, see below) |
+| `0x0050` | MIRROR_START | UTF-8 JSON `{}` | Mac→phone request to begin screen mirroring (phone still shows the MediaProjection consent dialog) |
+| `0x0051` | MIRROR_STOP | UTF-8 JSON `{}` | Either side stops an active mirroring session |
+| `0x0052` | MIRROR_CONFIG | UTF-8 JSON: `{"width": <int>, "height": <int>, "fps": <int>, "bitrateBps": <int>, "sps": "<base64 Annex-B>", "pps": "<base64 Annex-B>"}` | Phone→Mac video stream parameters + H.264 parameter sets (phone→Mac only) |
+| `0x0053` | MIRROR_FRAME | Binary: `u64 timestampMs (BE) | u8 keyframe | u32 accessUnitLength (BE) | Annex-B access unit` | One H.264 encoded access unit (phone→Mac only) |
+| `0x0054` | REMOTE_TOUCH | UTF-8 JSON: `{"action": "down"\|"move"\|"up", "x": <0..1>, "y": <0..1>}` | Mac→phone touch injection; coordinates normalized to the captured display |
+| `0x0060` | CRYPTO_M1 | Binary: 32 B (Noise XX `-> e`) | Initiator ephemeral key; raw Noise message, no extra length prefix |
+| `0x0061` | CRYPTO_M2 | Binary: 80 B + 112 B encrypted identity payload (Noise XX `<- e, ee, s, es`) | Responder ephemeral + static + identity |
+| `0x0062` | CRYPTO_M3 | Binary: 48 B + 112 B encrypted identity payload (Noise XX `-> s, se`) | Initiator static + identity |
 
 JSON is UTF-8 with these exact, case-sensitive key names.
+
+## Version negotiation
+
+- The 16-byte header `version` field must equal `1`. A frame with any other
+  version is rejected: the receiver sends `ERROR 409` and closes the
+  connection.
+- Both HANDSHAKE payloads carry `"protocolVersion": 2` (the encrypted-transport
+  revision; both ends ship together and there is no plaintext fallback). On
+  mismatch the receiver sends `ERROR 409` and closes the connection. A
+  HANDSHAKE without the field is treated as version 1 and rejected the same
+  way.
 
 ### FILE_CHUNK details
 
@@ -105,25 +128,81 @@ JSON is UTF-8 with these exact, case-sensitive key names.
 
 - Not part of the original Android protocol. Adds a one-time pairing token to
   the HANDSHAKE payload (`pairingToken` key, optional) so the phone can confirm
-  a pairing initiated by the Mac.
+  a pairing initiated by the Mac, plus an identity fingerprint for out-of-band
+  trust anchoring.
 - The Mac generates a **one-time token** (16 random bytes, base64url, no
   padding — 22 characters), held in memory for **5 minutes, single use**. It
   renders a QR code encoding:
-  `pocketlink://pair?v=1&t=<token>` (v = payload format version).
-- Flow: the Mac connects to the phone (normal flow) and sends HANDSHAKE
-  including `pairingToken` on every (re)connect while pairing is pending. The
-  phone scans the QR, stores the pending token, and when it sees a HANDSHAKE
-  whose `pairingToken` matches, replies with its own HANDSHAKE frame
-  (phone → Mac) carrying the scanned token. On match, the Mac auto-trusts the
-  peer and both sides mark the session as paired.
-- Compatibility:
-  - Phone without support: HANDSHAKE stays log-only; the Mac falls back to a
-    manual "trust" confirmation in its UI.
-  - Mac without support: phone HANDSHAKE frames are treated as an unknown
-    inbound message and ignored (older Macs had no HANDSHAKE handling).
+  `pocketlink://pair?v=2&t=<token>&k=<fingerprint>` where `<fingerprint>` is
+  the Mac identity's SHA-256 fingerprint (64 lowercase hex chars; `v = 2` since
+  the encrypted-transport milestone; `k` was added in the same revision).
+- Flow: the Mac connects to the phone (normal flow), completes the Noise
+  handshake, and sends HANDSHAKE including `pairingToken` on every (re)connect
+  while pairing is pending. The phone scans the QR (learning the token *and*
+  the Mac's identity fingerprint) and when it sees a HANDSHAKE whose
+  `pairingToken` matches, replies with its own HANDSHAKE frame (phone → Mac)
+  carrying the scanned token. On match, the Mac auto-trusts the peer and both
+  sides mark the session as paired.
+- **Fingerprint pinning:** the scanned `k` value pins the expected peer
+  identity fingerprint. After the phone verifies the initiator's M3 identity
+  payload, it compares the received fingerprint with the pinned one; on
+  mismatch the phone sends `ERROR 403` ("Device identity does not match the
+  scanned pairing code") and closes the connection. The Mac performs the
+  mirror-image check against its Trust Store (TOFU on first connect, pin
+  afterwards).
+- Compatibility: both ends of the current pairing ship together; older peers
+  (QR `v=1`) are rejected by the phone's `v=2` requirement and by the
+  `protocolVersion` handshake check.
 - The token is proximity proof only (someone physically scanned the screen);
-  it is not a shared secret over an encrypted channel — the wire remains
-  plaintext until the encryption milestone.
+  the actual channel security comes from the Noise handshake, with the QR
+  fingerprint providing the out-of-band authentication anchor.
+
+## Encrypted transport (C1)
+
+All application frames are encrypted after a Noise XX handshake. Both ends
+ship together; there is **no plaintext fallback**.
+
+### Crypto primitives (identical on both platforms)
+
+- Noise XX pattern over **X25519 / ChaChaPoly / SHA-256**
+  (`Noise_XX_25519_ChaChaPoly_SHA256`), implemented with CryptoKit (macOS) and
+  BouncyCastle (Android) to be byte-for-byte identical.
+- Device identity: Ed25519 keypair. The Ed25519 public key's SHA-256
+  (lowercase hex) is the **fingerprint** shown in the UI and embedded in the
+  QR code. The Noise static key is X25519; each handshake message's encrypted
+  payload carries the sender's Ed25519 public key plus an Ed25519 signature
+  over the sender's X25519 static public key, binding the two keys together
+  (96 B payload; 112 B on the wire with the AEAD tag).
+
+### Handshake messages (one per LINK frame, payload = raw Noise message)
+
+- `CRYPTO_M1` (0x0060): 32 B, `-> e`.
+- `CRYPTO_M2` (0x0061): 32 B ephemeral + 48 B encrypted static + 112 B
+  encrypted identity payload = 192 B, `<- e, ee, s, es`.
+- `CRYPTO_M3` (0x0062): 48 B encrypted static + 112 B encrypted identity
+  payload = 160 B, `-> s, se`.
+- The **macOS is the initiator** (sends M1/M3), Android the responder.
+- `split()` is direction-agnostic: it always returns (k1 = initiator→responder
+  send, k2 = responder→initiator send). The responder must mirror the states
+  when constructing its transport channel.
+
+### Transport rules
+
+- After the handshake every **application frame** is sealed
+  payload-only: the 16-byte wire header travels in the clear with
+  `payloadLength` set to the **ciphertext** size (plaintext + 16-byte
+  Poly1305 tag); the header bytes (magic, version, type, streamId,
+  payloadLength) are the AEAD **associated data**.
+- Per-direction 64-bit counters start at 0 and increment per frame; the
+  ChaChaPoly nonce is `4 zero bytes ‖ uint64 BE(counter)` (12 B).
+- CRYPTO_* frames and pre-channel ERROR frames are sent raw.
+- **Decrypt failure** → receiver sends `ERROR 401` (raw), discards the channel,
+  closes the connection.
+- **Plaintext application frame before the channel exists** → receiver sends
+  `ERROR 409 "Encrypted transport required"` and closes.
+- **Fingerprint mismatch** (QR pin / trust store) → `ERROR 403` and close.
+- ERROR frames sent *after* the channel is established are sealed like any
+  other application frame.
 
 ## Transport
 
@@ -141,9 +220,14 @@ JSON is UTF-8 with these exact, case-sensitive key names.
 
 ## Security
 
-The wire is currently plaintext on both platforms. Encryption/pairing
-(X25519/Ed25519, Noise XX) is a later milestone; frames are what both sides
-exchange today.
+The wire is fully encrypted once the Noise XX handshake completes (see
+*Encrypted transport (C1)* above): X25519 ECDH, ChaCha20-Poly1305 AEAD,
+SHA-256, with Ed25519 identity keys bound into the handshake and pinned
+out-of-band via the QR fingerprint. Private identity halves live in the
+macOS Keychain (`LinkIdentity`) and Android app-private storage
+(`filesDir/pocketlink-identity.json`, Keystore wrapping is a documented
+follow-up). Before the handshake, only CRYPTO_* handshake frames and raw
+ERROR frames are legal; anything else is rejected.
 
 ## Golden vectors
 
