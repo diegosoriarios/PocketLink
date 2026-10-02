@@ -1,120 +1,29 @@
 import XCTest
-import Network
 
 @testable import LinkProtocol
 @testable import LinkConnection
 
-final class ProtocolEchoServer: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "test.link.echo.server")
-    private let listener: NWListener
-    private var connection: NWConnection?
-    private var decoder = FrameDecoder()
-    private var portValue: UInt16 = 0
-    private var peerGone = false
+/// Loopback server with ping→pong echo behavior on top of the encrypted
+/// transport.
+final class ProtocolEchoServer: CryptoLoopbackServer, @unchecked Sendable {
     private var inboundPongs: [Frame] = []
 
     init() throws {
-        listener = try NWListener(using: .tcp, on: .any)
-        listener.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            if case .failed(let error) = state {
-                FileHandle.standardError.write(Data("SERVER failed: \(error)\n".utf8))
-            }
-            if let port = self.listener.port?.rawValue {
-                self.portValue = port
-            }
-        }
-        listener.newConnectionHandler = { [weak self] connection in
-            self?.accept(connection)
-        }
-        listener.start(queue: queue)
-    }
-
-    var boundPort: UInt16 {
-        let deadline = Date().addingTimeInterval(5)
-        while portValue == 0 && Date() < deadline {
-            usleep(10_000)
-        }
-        if portValue == 0 {
-            FileHandle.standardError.write(Data("SERVER boundPort timeout\n".utf8))
-        }
-        return portValue
-    }
-
-    var peerDisconnected: Bool {
-        queue.sync { peerGone }
+        try super.init(label: "test.link.echo.server")
     }
 
     var receivedPongs: [Frame] {
         queue.sync { inboundPongs }
     }
 
-    var peerAccepted: Bool {
-        queue.sync { connection != nil }
-    }
-
-    func inject(_ bytes: [UInt8]) {
-        queue.sync {
-            connection?.send(content: Data(bytes), completion: .contentProcessed { _ in })
-        }
-    }
-
-    func stop() {
-        queue.sync {
-            connection?.cancel()
-            listener.cancel()
-        }
-    }
-
-    private func accept(_ connection: NWConnection) {
-        queue.async {
-            self.connection = connection
-            connection.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .cancelled, .failed:
-                    self?.queue.async { self?.peerGone = true }
-                default:
-                    break
-                }
-            }
-            connection.start(queue: self.queue)
-            self.receiveLoop(connection)
-        }
-    }
-
-    private func receiveLoop(_ connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let data, !data.isEmpty {
-                self.consume(data, connection: connection)
-            }
-            if isComplete || error != nil {
-                self.queue.async { self.peerGone = true }
-                return
-            }
-            self.receiveLoop(connection)
-        }
-    }
-
-    private func consume(_ data: Data, connection: NWConnection) {
-        do {
-            let frames = try decoder.feed([UInt8](data))
-            for frame in frames {
-                switch frame.messageType {
-                case .ping:
-                    let pong = Frame(messageType: .pong, streamId: frame.streamId, payload: frame.payload)
-                    connection.send(
-                        content: Data(try FrameEncoder.encode(pong)),
-                        completion: .contentProcessed { _ in }
-                    )
-                case .pong:
-                    inboundPongs.append(frame)
-                default:
-                    break
-                }
-            }
-        } catch {
-            decoder.reset()
+    override func handlePlaintext(_ frame: Frame) {
+        switch frame.messageType {
+        case .ping:
+            sealAndSend(Frame(messageType: .pong, streamId: frame.streamId, payload: frame.payload))
+        case .pong:
+            queue.async { self.inboundPongs.append(frame) }
+        default:
+            break
         }
     }
 }
@@ -156,13 +65,12 @@ private final class StateBox: @unchecked Sendable {
 final class LinkClientIntegrationTests: XCTestCase {
     func testServerBinds() async throws {
         let server = try ProtocolEchoServer()
-        let port = server.boundPort
-        FileHandle.standardError.write(Data("bound to \(port)\n".utf8))
+        let port = try server.awaitBoundPort()
         XCTAssertGreaterThan(port, 0)
         server.stop()
     }
 
-    func testPingPongRoundTripOverLoopbackTCP() async throws {
+    func testEncryptedPingPongRoundTripOverLoopbackTCP() async throws {
         let server = try ProtocolEchoServer()
         defer { server.stop() }
 
@@ -180,7 +88,9 @@ final class LinkClientIntegrationTests: XCTestCase {
         }
         defer { framesTask.cancel() }
 
-        try await client.connect(host: "127.0.0.1", port: server.boundPort)
+        try await client.connect(host: "127.0.0.1", port: try server.awaitBoundPort())
+        let fingerprint = await client.peerFingerprint
+        XCTAssertFalse(fingerprint.isEmpty, "peer fingerprint must be set after the crypto handshake")
         let streamId = try await client.sendPing()
 
         await fulfillment(of: [pongReceived], timeout: 10)
@@ -207,20 +117,20 @@ final class LinkClientIntegrationTests: XCTestCase {
         }
         defer { framesTask.cancel() }
 
-        try await client.connect(host: "127.0.0.1", port: server.boundPort)
+        try await client.connect(host: "127.0.0.1", port: try server.awaitBoundPort())
 
-        let acceptedDeadline = Date().addingTimeInterval(5)
-        while !server.peerAccepted && Date() < acceptedDeadline {
+        let channelDeadline = Date().addingTimeInterval(5)
+        while !server.channelReady && Date() < channelDeadline {
             try await Task.sleep(for: .milliseconds(10))
         }
-        XCTAssertTrue(server.peerAccepted, "echo server never accepted the connection")
+        XCTAssertTrue(server.channelReady, "echo server never completed the Noise handshake")
 
         let androidSidePing = Frame(
             messageType: .ping,
             streamId: 99,
             payloadString: "{\"timestamp\":123}"
         )
-        server.inject(try FrameEncoder.encode(androidSidePing))
+        server.inject(androidSidePing)
 
         let deadline = Date().addingTimeInterval(10)
         while server.receivedPongs.isEmpty && Date() < deadline {
@@ -236,7 +146,7 @@ final class LinkClientIntegrationTests: XCTestCase {
         XCTAssertEqual(pong.payload, androidSidePing.payload)
     }
 
-    func testInvalidMagicFailsConnectionSafely() async throws {
+    func testInvalidMagicAfterHandshakeFailsConnectionSafely() async throws {
         let server = try ProtocolEchoServer()
         defer { server.stop() }
 
@@ -266,10 +176,13 @@ final class LinkClientIntegrationTests: XCTestCase {
         }
         defer { statesTask.cancel() }
 
-        try await client.connect(host: "127.0.0.1", port: server.boundPort)
-        try await Task.sleep(for: .milliseconds(150))
+        try await client.connect(host: "127.0.0.1", port: try server.awaitBoundPort())
+        let channelDeadline = Date().addingTimeInterval(5)
+        while !server.channelReady && Date() < channelDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
 
-        server.inject(Array("GARBAGEGARBAGE12".utf8))
+        server.injectRaw(Array("GARBAGEGARBAGE12".utf8))
 
         await fulfillment(of: [terminal], timeout: 10)
 
@@ -283,33 +196,25 @@ final class LinkClientIntegrationTests: XCTestCase {
     }
 
     func testDoubleConnectRejected() async throws {
-        func mark(_ label: String) {
-            FileHandle.standardError.write(Data("STEP \(label)\n".utf8))
-        }
-        mark("start")
         let server = try ProtocolEchoServer()
         defer { server.stop() }
-        mark("server-bound")
 
         let client = LinkClient()
-        try await client.connect(host: "127.0.0.1", port: server.boundPort)
-        mark("connected-1")
+        try await client.connect(host: "127.0.0.1", port: try server.awaitBoundPort())
 
         do {
-            try await client.connect(host: "127.0.0.1", port: server.boundPort)
+            try await client.connect(host: "127.0.0.1", port: try server.awaitBoundPort())
             XCTFail("second connect must throw")
         } catch let error as LinkClientError {
             XCTAssertEqual(error, .alreadyConnected)
         }
-        mark("second-rejected")
 
         await client.disconnect()
-        mark("disconnected")
     }
 
     func testConnectToRefusedPortThrows() async throws {
         let server = try ProtocolEchoServer()
-        let port = server.boundPort
+        let port = try server.awaitBoundPort()
         server.stop()
         try await Task.sleep(for: .milliseconds(150))
 

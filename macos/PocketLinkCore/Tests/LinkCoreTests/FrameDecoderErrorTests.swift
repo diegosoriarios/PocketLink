@@ -80,10 +80,15 @@ final class FrameDecoderErrorTests: XCTestCase {
         }
     }
 
-    func testVersionMismatchIsNotRejected() throws {
+    func testVersionMismatchThrowsAndResetsBuffer() throws {
         var decoder = FrameDecoder()
         let frame = Frame(version: 99, messageType: .ping, streamId: 1, payloadString: "{}")
-        let frames = try decoder.feed(try FrameEncoder.encode(frame))
-        XCTAssertEqual(frames, [frame])
+        XCTAssertThrowsError(try decoder.feed(try FrameEncoder.encode(frame))) { error in
+            XCTAssertEqual(error as? FrameDecodeError, .unsupportedVersion(received: 99))
+        }
+        let good = try FrameEncoder.encode(Frame(messageType: .ping, streamId: 1, payloadString: "{}"))
+        let frames = try decoder.feed(good)
+        XCTAssertEqual(frames.count, 1)
+        XCTAssertEqual(frames.first?.messageType, .ping)
     }
 }
