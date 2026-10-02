@@ -41,4 +41,5 @@ public enum FrameDecodeError: Error, Equatable, Sendable {
     case invalidMagic(offendingBytes: [UInt8])
     case frameOversized(declaredLength: UInt32)
     case unknownMessageType(id: UInt16)
+    case unsupportedVersion(received: UInt16)
 }

@@ -25,7 +25,7 @@ let package = Package(
         .target(name: "LinkProtocol"),
         .target(
             name: "LinkConnection",
-            dependencies: ["LinkProtocol"]
+            dependencies: ["LinkProtocol", "LinkSecurity"]
         ),
         .target(name: "LinkDiscovery"),
         .target(

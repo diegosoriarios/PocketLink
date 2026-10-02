@@ -2,13 +2,17 @@ import Foundation
 
 public struct TrustedPeer: Sendable, Equatable, Codable {
     public let id: String
-    public let name: String
+    public var name: String
     public let addedAt: Date
+    /// SHA-256 fingerprint (hex) of the peer's Ed25519 identity key, pinned on
+    /// first pairing (TOFU). `nil` for entries created before C1.
+    public var fingerprint: String?
 
-    public init(id: String, name: String, addedAt: Date) {
+    public init(id: String, name: String, addedAt: Date, fingerprint: String? = nil) {
         self.id = id
         self.name = name
         self.addedAt = addedAt
+        self.fingerprint = fingerprint
     }
 }
 
@@ -26,9 +30,21 @@ public actor TrustStore {
         peers[id] != nil
     }
 
-    public func trust(_ id: String, name: String) throws {
-        if let existing = peers[id], existing.name == name { return }
-        peers[id] = TrustedPeer(id: id, name: name, addedAt: Date())
+    public func fingerprint(for id: String) -> String? {
+        peers[id]?.fingerprint
+    }
+
+    public func trust(_ id: String, name: String, fingerprint: String? = nil) throws {
+        if var existing = peers[id] {
+            if existing.name == name, existing.fingerprint == fingerprint { return }
+            existing.name = name
+            if let fingerprint {
+                existing.fingerprint = fingerprint
+            }
+            peers[id] = existing
+        } else {
+            peers[id] = TrustedPeer(id: id, name: name, addedAt: Date(), fingerprint: fingerprint)
+        }
         try persist()
     }
 

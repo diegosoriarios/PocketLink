@@ -9,25 +9,39 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.net.wifi.WifiManager.WifiLock
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import com.diego.pocketlink.MainActivity
 import com.diego.pocketlink.R
 import com.diego.pocketlink.battery.BatteryStatus
+import com.diego.pocketlink.clipboard.ClipboardSettings
+import com.diego.pocketlink.security.LinkIdentity
 import com.diego.pocketlink.battery.BatterySyncManager
 import com.diego.pocketlink.clipboard.ClipboardSyncManager
 import com.diego.pocketlink.discovery.DiscoveredDevice
 import com.diego.pocketlink.discovery.NsdAdvertiser
 import com.diego.pocketlink.discovery.NsdBrowser
 import com.diego.pocketlink.files.FileTransferEngine
+import com.diego.pocketlink.files.TransferDirection
+import com.diego.pocketlink.files.TransferHistoryStore
 import com.diego.pocketlink.files.TransferProgress
+import com.diego.pocketlink.mirroring.MirrorConsentRouter
+import com.diego.pocketlink.mirroring.MirroringAccessibilityService
+import com.diego.pocketlink.mirroring.MirroringService
 import com.diego.pocketlink.notifications.ForwardedNotification
 import com.diego.pocketlink.notifications.LinkNotificationListenerService
+import com.diego.pocketlink.protocol.MirrorProtocol
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.launchIn
@@ -42,28 +56,34 @@ class ConnectionService : Service() {
     private var clipboardSyncManager: ClipboardSyncManager? = null
     private var batterySyncManager: BatterySyncManager? = null
     private var fileTransferEngine: FileTransferEngine? = null
+    private var wifiLock: WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        val manager = ConnectionManager(serviceScope)
+        acquireWifiLock()
+        val manager = ConnectionManager(serviceScope, LinkIdentity.load(applicationContext))
         connectionManager = manager
-        _connectionStateFlow = manager.connectionState
-        _eventsFlow = manager.events
+
+        // Bridge per-instance flows into the stable companion flows so UI
+        // collectors survive service stop/start cycles.
+        manager.connectionState.onEach { _connectionStateFlow.value = it }.launchIn(serviceScope)
+        manager.events.onEach { _eventsFlow.tryEmit(it) }.launchIn(serviceScope)
 
         val advertiser = NsdAdvertiser(this)
         nsdAdvertiser = advertiser
 
         val browser = NsdBrowser(this, serviceScope)
         nsdBrowser = browser
-        _discoveredDevicesFlow = browser.discoveredDevices
+        browser.discoveredDevices.onEach { _discoveredDevicesFlow.value = it }.launchIn(serviceScope)
 
-        val fileEngine = FileTransferEngine(this, serviceScope) { typeId, payload ->
+        val fileEngine = FileTransferEngine(this, serviceScope, TransferHistoryStore.get(applicationContext)) { typeId, payload ->
             manager.sendRawFrame(typeId, payload)
         }
         fileTransferEngine = fileEngine
         manager.fileTransferEngine = fileEngine
-        _transferProgressFlow = fileEngine.transferProgress
+        fileEngine.sendProgress.onEach { _sendTransferProgressFlow.value = it }.launchIn(serviceScope)
+        fileEngine.receiveProgress.onEach { _receiveTransferProgressFlow.value = it }.launchIn(serviceScope)
 
         // Initialize ClipboardSyncManager
         val clipboardMgr = ClipboardSyncManager(this) { localText ->
@@ -71,13 +91,19 @@ class ConnectionService : Service() {
         }
         clipboardSyncManager = clipboardMgr
         clipboardMgr.startListening()
-
         manager.onRemoteClipboardReceived = { remoteText ->
             clipboardMgr.setRemoteClipboard(remoteText)
         }
 
         manager.onNotificationReplyReceived = { id, text ->
-            LinkNotificationListenerService.instance?.handleReply(id, text)
+            val success = LinkNotificationListenerService.instance?.handleReply(id, text) ?: false
+            instance?.connectionManager?.sendNotificationReplyAck(id, success)
+        }
+
+        manager.onNotificationActionReceived = { id, action ->
+            when (action) {
+                "dismiss" -> LinkNotificationListenerService.instance?.handleDismiss(id)
+            }
         }
 
         // Initialize BatterySyncManager
@@ -97,7 +123,20 @@ class ConnectionService : Service() {
                     manager.sendBatteryStatus(status)
                 }
             }
+            if (state !is ConnectionState.Connected && MirroringService.isRunning) {
+                MirroringService.stop(this)
+            }
         }.launchIn(serviceScope)
+
+        manager.onMirrorStartRequested = {
+            MirrorConsentRouter.requestConsent(this)
+        }
+        manager.onMirrorStopRequested = {
+            MirroringService.stop(this)
+        }
+        manager.onRemoteTouchReceived = { action, x, y ->
+            MirroringAccessibilityService.dispatchTouch(action, x, y)
+        }
 
         instance = this
     }
@@ -129,13 +168,34 @@ class ConnectionService : Service() {
         nsdAdvertiser?.unregisterService()
         nsdBrowser?.stopDiscovery()
         connectionManager?.stopServer()
+        releaseWifiLock()
         serviceScope.cancel()
+        // The companion flows are intentionally left as-is: they are stable
+        // process-level bridges and the UI keeps collecting them across
+        // service restarts. Reset the externally visible state so a stopped
+        // service does not appear connected.
+        _connectionStateFlow.value = ConnectionState.Disconnected
+        _discoveredDevicesFlow.value = emptyList()
         instance = null
-        _connectionStateFlow = null
-        _eventsFlow = null
-        _discoveredDevicesFlow = null
-        _transferProgressFlow = null
         super.onDestroy()
+    }
+
+    private fun acquireWifiLock() {
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        @Suppress("DEPRECATION")
+        val lock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PocketLink:WifiLock")
+        lock.setReferenceCounted(false)
+        lock.acquire()
+        wifiLock = lock
+    }
+
+    private fun releaseWifiLock() {
+        wifiLock?.let { lock ->
+            if (lock.isHeld) {
+                lock.release()
+            }
+        }
+        wifiLock = null
     }
 
     private fun startForegroundServiceWithNotification() {
@@ -213,24 +273,36 @@ class ConnectionService : Service() {
         const val ACTION_STOP = "com.diego.pocketlink.action.STOP_SERVICE"
         const val EXTRA_PORT = "com.diego.pocketlink.extra.PORT"
 
-        private var _connectionStateFlow: StateFlow<ConnectionState>? = null
-        val connectionStateFlow: StateFlow<ConnectionState>? get() = _connectionStateFlow
+        // Stable process-level flow bridges. The service instance (and with it
+        // every ConnectionManager/NsdBrowser/FileTransferEngine) is destroyed and
+        // recreated on stop/start, so observers must never hold a reference to a
+        // per-instance flow — those would go dead the moment the service stops.
+        // Instead each service instance writes into these shared flows, which
+        // survive restarts and keep UI collectors attached.
+        private val _connectionStateFlow = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+        val connectionStateFlow: StateFlow<ConnectionState> = _connectionStateFlow
 
-        private var _eventsFlow: SharedFlow<ConnectionEvent>? = null
-        val eventsFlow: SharedFlow<ConnectionEvent>? get() = _eventsFlow
+        private val _eventsFlow = MutableSharedFlow<ConnectionEvent>(extraBufferCapacity = 64)
+        val eventsFlow: SharedFlow<ConnectionEvent> = _eventsFlow
 
-        private var _discoveredDevicesFlow: StateFlow<List<DiscoveredDevice>>? = null
-        val discoveredDevicesFlow: StateFlow<List<DiscoveredDevice>>? get() = _discoveredDevicesFlow
+        private val _discoveredDevicesFlow = MutableStateFlow<List<DiscoveredDevice>>(emptyList())
+        val discoveredDevicesFlow: StateFlow<List<DiscoveredDevice>> = _discoveredDevicesFlow
 
-        private var _transferProgressFlow: StateFlow<TransferProgress?>? = null
-        val transferProgressFlow: StateFlow<TransferProgress?>? get() = _transferProgressFlow
+        private val _sendTransferProgressFlow = MutableStateFlow<TransferProgress?>(null)
+        val sendTransferProgressFlow: StateFlow<TransferProgress?> = _sendTransferProgressFlow
+
+        private val _receiveTransferProgressFlow = MutableStateFlow<TransferProgress?>(null)
+        val receiveTransferProgressFlow: StateFlow<TransferProgress?> = _receiveTransferProgressFlow
 
         @Volatile
         var pendingPairingToken: PendingPairingToken? = null
             private set
 
-        fun setPendingPairingToken(token: String) {
-            pendingPairingToken = PendingPairingToken(token)
+        fun setPendingPairingToken(pairing: QrPairing) {
+            pendingPairingToken = PendingPairingToken(
+                value = pairing.token,
+                identityFingerprint = pairing.identityFingerprint
+            )
         }
 
         fun clearPendingPairingToken() {
@@ -267,18 +339,62 @@ class ConnectionService : Service() {
             instance?.fileTransferEngine?.sendFile(uri)
         }
 
-        fun cancelFileTransfer() {
-            instance?.fileTransferEngine?.cancelTransfer()
+        fun cancelFileTransfer(direction: TransferDirection) {
+            instance?.fileTransferEngine?.let { engine ->
+                when (direction) {
+                    TransferDirection.SEND -> engine.cancelSendTransfer()
+                    TransferDirection.RECEIVE -> engine.cancelReceiveTransfer()
+                }
+            }
+        }
+
+        fun dismissFileTransfer(direction: TransferDirection) {
+            instance?.fileTransferEngine?.dismissResult(direction)
+        }
+
+        fun isIgnoringBatteryOptimizations(context: Context): Boolean {
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            return powerManager.isIgnoringBatteryOptimizations(context.packageName)
+        }
+
+        fun requestIgnoreBatteryOptimizations(activity: android.app.Activity) {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(Uri.parse("package:${activity.packageName}"))
+            activity.startActivity(intent)
         }
 
         fun sendNotification(notification: ForwardedNotification): Boolean {
             return instance?.connectionManager?.sendNotification(notification) ?: false
         }
 
+        fun sendMirrorConfig(config: MirrorProtocol.MirrorConfig): Boolean {
+            return instance?.connectionManager?.sendMirrorConfig(config) ?: false
+        }
+
+        fun sendMirrorFrame(timestampMs: Long, keyframe: Boolean, accessUnit: ByteArray): Boolean {
+            return instance?.connectionManager?.sendMirrorFrame(timestampMs, keyframe, accessUnit) ?: false
+        }
+
+        fun sendMirrorStop(): Boolean {
+            return instance?.connectionManager?.sendMirrorStop() ?: false
+        }
+
+        fun requestMirrorConsent(context: Context) {
+            MirrorConsentRouter.requestConsent(context.applicationContext)
+        }
+
         fun syncClipboardNow(): Boolean {
             val inst = instance ?: return false
             val text = inst.clipboardSyncManager?.readLocalClipboard() ?: return false
             return inst.connectionManager?.sendClipboard(text) ?: false
+        }
+
+        fun isClipboardAutoSendEnabled(context: Context): Boolean =
+            ClipboardSettings.load(context.applicationContext)
+
+        fun setClipboardAutoSend(context: Context, enabled: Boolean) {
+            ClipboardSettings.save(context.applicationContext, enabled)
+            instance?.clipboardSyncManager?.isAutoSendEnabled = enabled
         }
 
         fun getBatteryStatus(): BatteryStatus? {

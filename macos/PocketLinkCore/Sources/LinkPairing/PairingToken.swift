@@ -2,22 +2,40 @@ import Foundation
 
 public struct PairingToken: Sendable, Equatable {
     public static let defaultLifetime: TimeInterval = 5 * 60
-    public static let payloadVersion = 1
+    public static let payloadVersion = 2
 
     public let value: String
+    /// SHA-256 fingerprint (lowercase hex) of the Mac's Ed25519 identity key,
+    /// embedded in the QR payload so the phone can pin it during pairing.
+    public let identityFingerprint: String?
     public let createdAt: Date
     public let lifetime: TimeInterval
 
-    public init(value: String, createdAt: Date = Date(), lifetime: TimeInterval = PairingToken.defaultLifetime) {
+    public init(
+        value: String,
+        identityFingerprint: String? = nil,
+        createdAt: Date = Date(),
+        lifetime: TimeInterval = PairingToken.defaultLifetime
+    ) {
         self.value = value
+        self.identityFingerprint = identityFingerprint
         self.createdAt = createdAt
         self.lifetime = lifetime
     }
 
-    public static func generate(now: Date = Date(), lifetime: TimeInterval = defaultLifetime) -> PairingToken {
+    public static func generate(
+        identityFingerprint: String? = nil,
+        now: Date = Date(),
+        lifetime: TimeInterval = defaultLifetime
+    ) -> PairingToken {
         var generator = SystemRandomNumberGenerator()
         let bytes = (0..<16).map { _ in UInt8.random(in: .min ... .max, using: &generator) }
-        return PairingToken(value: encode(bytes), createdAt: now, lifetime: lifetime)
+        return PairingToken(
+            value: encode(bytes),
+            identityFingerprint: identityFingerprint,
+            createdAt: now,
+            lifetime: lifetime
+        )
     }
 
     public var isExpired: Bool {
@@ -29,7 +47,11 @@ public struct PairingToken: Sendable, Equatable {
     }
 
     public var qrPayload: String {
-        "pocketlink://pair?v=\(Self.payloadVersion)&t=\(value)"
+        var payload = "pocketlink://pair?v=\(Self.payloadVersion)&t=\(value)"
+        if let fingerprint = identityFingerprint {
+            payload += "&k=\(fingerprint)"
+        }
+        return payload
     }
 
     private static func encode(_ bytes: [UInt8]) -> String {

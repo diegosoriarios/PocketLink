@@ -4,6 +4,11 @@ object ProtocolConstants {
     val MAGIC_BYTES: ByteArray = "LINK".toByteArray(Charsets.US_ASCII)
     const val HEADER_SIZE: Int = 16
     const val PROTOCOL_VERSION: UShort = 1u
+    /**
+     * Version carried inside the HANDSHAKE payload. 2 means "encrypted
+     * transport required" (Noise XX). The 16-byte header version stays 1.
+     */
+    const val HANDSHAKE_VERSION: UInt = 2u
     const val MAX_PAYLOAD_SIZE: UInt = 8_388_608u // 8 MB limit
 }
 

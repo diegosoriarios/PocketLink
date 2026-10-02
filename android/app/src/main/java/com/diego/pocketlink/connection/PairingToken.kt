@@ -2,6 +2,8 @@ package com.diego.pocketlink.connection
 
 data class PendingPairingToken(
     val value: String,
+    /** SHA-256 fingerprint (hex) of the Mac's Ed25519 identity key, pinned from the QR code. */
+    val identityFingerprint: String? = null,
     val receivedAtMillis: Long = System.currentTimeMillis()
 ) {
     fun isExpired(nowMs: Long = System.currentTimeMillis()): Boolean {
@@ -14,7 +16,7 @@ data class PendingPairingToken(
 }
 
 object QrPairingPayload {
-    fun parse(raw: String): String? {
+    fun parse(raw: String): QrPairing? {
         val trimmed = raw.trim()
         if (!trimmed.startsWith("pocketlink://pair?")) return null
         val queryString = trimmed.substringAfter("pocketlink://pair?")
@@ -24,8 +26,15 @@ object QrPairingPayload {
             val value = parts.getOrNull(1) ?: ""
             key to value
         }
-        if (params["v"] != "1") return null
-        val token = params["t"]
-        return if (!token.isNullOrBlank()) token else null
+        if (params["v"] != "2") return null
+        val token = params["t"] ?: return null
+        if (token.isBlank()) return null
+        val fingerprint = params["k"]?.takeIf { it.isNotBlank() }
+        return QrPairing(token = token, identityFingerprint = fingerprint)
     }
 }
+
+data class QrPairing(
+    val token: String,
+    val identityFingerprint: String?
+)

@@ -10,6 +10,7 @@ class ProtocolDecoder {
     /**
      * Appends bytes to decoder buffer and returns any fully decoded frames.
      * @throws InvalidFrameException if magic bytes do not match "LINK"
+     * @throws UnsupportedVersionException if header version != PROTOCOL_VERSION
      * @throws FrameOversizedException if frame payload exceeds MAX_PAYLOAD_SIZE
      * @throws UnknownMessageTypeException if message type ID is not recognized
      */
@@ -39,6 +40,11 @@ class ProtocolDecoder {
             val messageTypeId = byteBuffer.short.toUShort()
             val streamId = byteBuffer.int.toUInt()
             val payloadLength = byteBuffer.int.toUInt()
+
+            if (version != ProtocolConstants.PROTOCOL_VERSION) {
+                reset()
+                throw UnsupportedVersionException(version)
+            }
 
             if (payloadLength > ProtocolConstants.MAX_PAYLOAD_SIZE) {
                 reset()

@@ -127,4 +127,44 @@ class ProtocolEncoderDecoderTest {
             decoder.feed(headerBytes)
         }
     }
+
+    @Test
+    fun testUnsupportedVersion_throwsException() {
+        val headerBytes = ByteBuffer.allocate(ProtocolConstants.HEADER_SIZE).order(ByteOrder.BIG_ENDIAN)
+            .put(ProtocolConstants.MAGIC_BYTES)
+            .putShort(99) // Unsupported version
+            .putShort(MessageType.PING.id.toShort())
+            .putInt(1)
+            .putInt(0)
+            .array()
+
+        assertThrows(UnsupportedVersionException::class.java) {
+            decoder.feed(headerBytes)
+        }
+    }
+
+    @Test
+    fun testUnsupportedVersion_resetsBufferForNextFeed() {
+        val badHeader = ByteBuffer.allocate(ProtocolConstants.HEADER_SIZE).order(ByteOrder.BIG_ENDIAN)
+            .put(ProtocolConstants.MAGIC_BYTES)
+            .putShort(99)
+            .putShort(MessageType.PING.id.toShort())
+            .putInt(1)
+            .putInt(0)
+            .array()
+
+        assertThrows(UnsupportedVersionException::class.java) {
+            decoder.feed(badHeader)
+        }
+
+        val goodFrame = ProtocolEncoder.encode(
+            Frame(
+                header = FrameHeader(messageType = MessageType.PING, streamId = 1u, payloadLength = 0u),
+                payload = ByteArray(0)
+            )
+        )
+        val frames = decoder.feed(goodFrame)
+        assertEquals(1, frames.size)
+        assertEquals(MessageType.PING, frames[0].header.messageType)
+    }
 }

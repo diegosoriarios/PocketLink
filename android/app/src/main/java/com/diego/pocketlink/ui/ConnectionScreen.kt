@@ -1,7 +1,9 @@
 package com.diego.pocketlink.ui
 
 import android.Manifest
+import android.app.Activity
 import android.content.pm.PackageManager
+import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -21,6 +23,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -30,7 +33,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -50,6 +55,8 @@ import androidx.core.content.ContextCompat
 import com.diego.pocketlink.battery.BatteryStatus
 import com.diego.pocketlink.connection.ConnectionState
 import com.diego.pocketlink.discovery.DiscoveredDevice
+import com.diego.pocketlink.files.TransferDirection
+import com.diego.pocketlink.files.TransferHistoryEntry
 import com.diego.pocketlink.files.TransferProgress
 import com.diego.pocketlink.files.TransferState
 import com.diego.pocketlink.qr.QrScannerScreen
@@ -63,7 +70,10 @@ fun ConnectionScreen(
     val uiState by viewModel.uiState.collectAsState()
     val discoveredDevices by viewModel.discoveredDevices.collectAsState()
     val batteryStatus by viewModel.batteryStatus.collectAsState()
-    val transferProgress by viewModel.fileTransferProgress.collectAsState()
+    val sendTransferProgress by viewModel.sendTransferProgress.collectAsState()
+    val receiveTransferProgress by viewModel.receiveTransferProgress.collectAsState()
+    val transferHistory by viewModel.transferHistory.collectAsState()
+    val clipboardAutoSend by viewModel.clipboardAutoSend.collectAsState()
     val isNotificationGranted by viewModel.isNotificationListenerGranted.collectAsState()
     val logs by viewModel.logs.collectAsState()
 
@@ -132,9 +142,18 @@ fun ConnectionScreen(
                 item {
                     FileTransferCard(
                         isConnected = uiState is ConnectionState.Connected,
-                        progress = transferProgress,
+                        sendProgress = sendTransferProgress,
+                        receiveProgress = receiveTransferProgress,
                         onPickFile = { filePickerLauncher.launch("*/*") },
-                        onCancel = { viewModel.cancelFileTransfer() }
+                        onCancel = { viewModel.cancelFileTransfer(it) },
+                        onDismiss = { viewModel.dismissFileTransfer(it) }
+                    )
+                }
+
+                item {
+                    RecentTransfersCard(
+                        history = transferHistory,
+                        onClear = { viewModel.clearTransferHistory() }
                     )
                 }
 
@@ -149,7 +168,23 @@ fun ConnectionScreen(
                     BatteryAndClipboardCard(
                         batteryStatus = batteryStatus,
                         isConnected = uiState is ConnectionState.Connected,
-                        onSyncClipboard = { viewModel.syncClipboardNow() }
+                        isIgnoringBatteryOptimizations = remember(batteryStatus) {
+                            viewModel.isIgnoringBatteryOptimizations()
+                        },
+                        clipboardAutoSend = clipboardAutoSend,
+                        onRequestBatteryExemption = {
+                            (context as? Activity)?.let { viewModel.requestIgnoreBatteryOptimizations(it) }
+                        },
+                        onSyncClipboard = { viewModel.syncClipboardNow() },
+                        onClipboardAutoSendChange = { viewModel.setClipboardAutoSend(it) }
+                    )
+                }
+
+                item {
+                    MirroringCard(
+                        isConnected = uiState is ConnectionState.Connected,
+                        onStart = { viewModel.startMirroring() },
+                        onStop = { viewModel.stopMirroring() }
                     )
                 }
 
@@ -189,10 +224,59 @@ fun ConnectionScreen(
 }
 
 @Composable
+private fun MirroringCard(
+    isConnected: Boolean,
+    onStart: () -> Unit,
+    onStop: () -> Unit
+) {
+    val isMirroring by com.diego.pocketlink.mirroring.MirroringService.isRunningFlow.collectAsState()
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "Screen Mirroring",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = if (isMirroring) {
+                    "Your screen is being shared with the connected Mac."
+                } else {
+                    "Share your phone screen with the Mac. You will be asked to confirm before capture starts."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
+            )
+            if (isMirroring) {
+                Button(
+                    onClick = onStop,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB3261E))
+                ) {
+                    Text("Stop Mirroring")
+                }
+            } else {
+                Button(
+                    onClick = onStart,
+                    enabled = isConnected
+                ) {
+                    Text("Start Mirroring")
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun QrPairingCard(
     onScanClick: () -> Unit
-) {
-    Card(
+) {    Card(
         modifier = Modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
@@ -335,10 +419,14 @@ private fun ConnectionStatusCard(
 @Composable
 private fun FileTransferCard(
     isConnected: Boolean,
-    progress: TransferProgress?,
+    sendProgress: TransferProgress?,
+    receiveProgress: TransferProgress?,
     onPickFile: () -> Unit,
-    onCancel: () -> Unit
+    onCancel: (TransferDirection) -> Unit,
+    onDismiss: (TransferDirection) -> Unit
 ) {
+    val context = LocalContext.current
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
@@ -350,61 +438,217 @@ private fun FileTransferCard(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text(
-                text = "Chunked File Transfer (SAF / MediaStore)",
+                text = "File Transfer",
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold
             )
 
-            if (progress != null && progress.state != TransferState.IDLE) {
-                Text(
-                    text = "File: ${progress.fileName}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
+            val sendRow = sendProgress?.takeIf { it.state != TransferState.IDLE }
+            val receiveRow = receiveProgress?.takeIf { it.state != TransferState.IDLE }
 
-                if (progress.totalBytes > 0) {
-                    LinearProgressIndicator(
-                        progress = { progress.fraction },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Text(
-                        text = "${(progress.fraction * 100).toInt()}% (${progress.bytesTransferred} / ${progress.totalBytes} bytes)",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-
-                Text(
-                    text = "Status: ${progress.state}" + (progress.errorMessage?.let { " ($it)" } ?: ""),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = when (progress.state) {
-                        TransferState.COMPLETED -> Color(0xFF4CAF50)
-                        TransferState.FAILED -> MaterialTheme.colorScheme.error
-                        else -> MaterialTheme.colorScheme.primary
-                    }
-                )
-
-                if (progress.state == TransferState.IN_PROGRESS) {
-                    OutlinedButton(
-                        onClick = onCancel,
-                        modifier = Modifier.align(Alignment.End)
-                    ) {
-                        Text("Cancel Transfer")
-                    }
-                }
-            } else {
+            if (sendRow == null && receiveRow == null) {
                 Text(
                     text = "Select any file to transfer in chunks with SHA-256 integrity verification.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color.Gray
                 )
+            } else {
+                sendRow?.let { progress ->
+                    TransferRow(
+                        progress = progress,
+                        context = context,
+                        onCancel = { onCancel(TransferDirection.SEND) },
+                        onDismiss = { onDismiss(TransferDirection.SEND) }
+                    )
+                }
+                receiveRow?.let { progress ->
+                    TransferRow(
+                        progress = progress,
+                        context = context,
+                        onCancel = { onCancel(TransferDirection.RECEIVE) },
+                        onDismiss = { onDismiss(TransferDirection.RECEIVE) }
+                    )
+                }
             }
 
             Button(
                 onClick = onPickFile,
-                enabled = isConnected && (progress?.state != TransferState.IN_PROGRESS),
+                enabled = isConnected &&
+                    sendProgress?.state != TransferState.IN_PROGRESS &&
+                    sendProgress?.state != TransferState.VERIFYING,
                 modifier = Modifier.align(Alignment.End)
             ) {
                 Text("Send File to Mac")
+            }
+        }
+    }
+}
+
+@Composable
+private fun TransferRow(
+    progress: TransferProgress,
+    context: android.content.Context,
+    onCancel: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = when (progress.direction) {
+                    TransferDirection.SEND -> "↑ Sending to Mac"
+                    TransferDirection.RECEIVE -> "↓ Receiving from Mac"
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            if (progress.state.isTerminal) {
+                TextButton(onClick = onDismiss) {
+                    Text("Dismiss")
+                }
+            }
+        }
+
+        Text(
+            text = progress.fileName,
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.Gray
+        )
+
+        if (progress.state == TransferState.IN_PROGRESS) {
+            if (progress.totalBytes > 0) {
+                LinearProgressIndicator(
+                    progress = { progress.fraction },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    text = "${(progress.fraction * 100).toInt()}% · " +
+                        "${Formatter.formatFileSize(context, progress.bytesTransferred)} of " +
+                        Formatter.formatFileSize(context, progress.totalBytes),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            } else {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+        }
+
+        Text(
+            text = transferStatusText(progress),
+            style = MaterialTheme.typography.bodySmall,
+            color = transferStatusColor(progress)
+        )
+
+        if (progress.state == TransferState.IN_PROGRESS) {
+            OutlinedButton(
+                onClick = onCancel,
+                modifier = Modifier.align(Alignment.End)
+            ) {
+                Text("Cancel Transfer")
+            }
+        }
+    }
+}
+
+private fun transferStatusText(progress: TransferProgress): String {
+    return transferStatusText(progress.state, progress.errorMessage)
+}
+
+private fun transferStatusText(state: TransferState, errorMessage: String?): String {
+    return when (state) {
+        TransferState.IN_PROGRESS -> "Transferring…"
+        TransferState.VERIFYING -> "Sent · verifying checksum…"
+        TransferState.DELIVERED -> "Delivered ✓"
+        TransferState.COMPLETED -> "Received · Saved to Downloads/PocketLink"
+        TransferState.CANCELLED -> "Transfer cancelled"
+        TransferState.MISMATCH -> "Receiver reported checksum mismatch"
+        TransferState.FAILED -> errorMessage?.let { "Failed — $it" } ?: "Failed"
+        TransferState.IDLE -> ""
+    }
+}
+
+@Composable
+private fun transferStatusColor(progress: TransferProgress): Color {
+    return transferStatusColor(progress.state)
+}
+
+@Composable
+private fun transferStatusColor(state: TransferState): Color {
+    return when (state) {
+        TransferState.DELIVERED, TransferState.COMPLETED -> Color(0xFF4CAF50)
+        TransferState.FAILED, TransferState.MISMATCH -> MaterialTheme.colorScheme.error
+        TransferState.CANCELLED -> Color.Gray
+        else -> MaterialTheme.colorScheme.primary
+    }
+}
+
+@Composable
+private fun RecentTransfersCard(
+    history: List<TransferHistoryEntry>,
+    onClear: () -> Unit
+) {
+    val context = LocalContext.current
+    val dateFormat = remember { java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault()) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Recent transfers",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onClear) {
+                    Text("Clear")
+                }
+            }
+
+            history.forEach { entry ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = when (entry.direction) {
+                            TransferDirection.SEND -> "↑"
+                            TransferDirection.RECEIVE -> "↓"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        color = transferStatusColor(entry.state)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = entry.fileName,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1
+                        )
+                        Text(
+                            text = "${transferStatusText(entry.state, entry.errorMessage)} · " +
+                                "${Formatter.formatFileSize(context, entry.totalBytes)} · " +
+                                dateFormat.format(java.util.Date(entry.timestamp)),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = transferStatusColor(entry.state)
+                        )
+                    }
+                }
             }
         }
     }
@@ -476,7 +720,11 @@ private fun NotificationForwardingCard(
 private fun BatteryAndClipboardCard(
     batteryStatus: BatteryStatus?,
     isConnected: Boolean,
-    onSyncClipboard: () -> Unit
+    isIgnoringBatteryOptimizations: Boolean,
+    clipboardAutoSend: Boolean,
+    onRequestBatteryExemption: () -> Unit,
+    onSyncClipboard: () -> Unit,
+    onClipboardAutoSendChange: (Boolean) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -507,11 +755,49 @@ private fun BatteryAndClipboardCard(
                 style = MaterialTheme.typography.bodyMedium
             )
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Background keep-alive",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (isIgnoringBatteryOptimizations) {
+                    Text(
+                        text = "Enabled",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF4CAF50)
+                    )
+                } else {
+                    OutlinedButton(onClick = onRequestBatteryExemption) {
+                        Text("Whitelist app", fontSize = 12.sp)
+                    }
+                }
+            }
+
             Text(
                 text = "Clipboard sync works bidirectionally. Android 10+ background read restrictions apply when app is in background.",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.Gray
             )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Auto-send clipboard to Mac",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Switch(
+                    checked = clipboardAutoSend,
+                    onCheckedChange = onClipboardAutoSendChange
+                )
+            }
 
             Button(
                 onClick = onSyncClipboard,

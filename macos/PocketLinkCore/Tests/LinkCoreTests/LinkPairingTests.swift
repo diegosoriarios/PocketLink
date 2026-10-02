@@ -83,6 +83,10 @@ final class HandshakeMessageTests: XCTestCase {
         XCTAssertEqual(device, "Diego's MacBook")
         let platform = dictionary["platform"] as? String
         XCTAssertEqual(platform, "macOS")
+        XCTAssertEqual(dictionary["protocolVersion"] as? Int, LinkProtocolConstants.handshakeVersion)
+
+        let info = try XCTUnwrap(HandshakeMessage.parse(decoded[0]))
+        XCTAssertEqual(info.protocolVersion, LinkProtocolConstants.handshakeVersion)
     }
 
     func testEscapesSpecialCharactersInDeviceName() throws {
@@ -128,6 +132,17 @@ final class HandshakeMessageTests: XCTestCase {
         XCTAssertEqual(info.device, "Pixel 8")
         XCTAssertEqual(info.platform, "")
         XCTAssertNil(info.pairingToken)
+        XCTAssertEqual(info.protocolVersion, 1)
+    }
+
+    func testParsesProtocolVersionFromPayload() throws {
+        let v2 = Frame(
+            messageType: .handshake,
+            streamId: 0,
+            payloadString: "{\"device\":\"Pixel 8\",\"platform\":\"Android\",\"protocolVersion\":2}"
+        )
+        let info = try XCTUnwrap(HandshakeMessage.parse(v2))
+        XCTAssertEqual(info.protocolVersion, 2)
     }
 }
 
@@ -161,6 +176,15 @@ final class PairingTokenTests: XCTestCase {
 
     func testQRPayloadFormat() {
         let token = PairingToken(value: "AbC-dE_", createdAt: Date())
-        XCTAssertEqual(token.qrPayload, "pocketlink://pair?v=1&t=AbC-dE_")
+        XCTAssertEqual(token.qrPayload, "pocketlink://pair?v=2&t=AbC-dE_")
+    }
+
+    func testQRPayloadCarriesIdentityFingerprint() {
+        let token = PairingToken(
+            value: "AbC-dE_",
+            identityFingerprint: "a1b2c3",
+            createdAt: Date()
+        )
+        XCTAssertEqual(token.qrPayload, "pocketlink://pair?v=2&t=AbC-dE_&k=a1b2c3")
     }
 }

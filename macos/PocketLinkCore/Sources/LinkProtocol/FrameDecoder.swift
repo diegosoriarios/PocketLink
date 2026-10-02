@@ -34,6 +34,10 @@ public struct FrameDecoder: Sendable {
             }
 
             let version = Self.readUInt16BE(buffer, offset: base + 4)
+            guard version == LinkProtocolConstants.protocolVersion else {
+                reset()
+                throw FrameDecodeError.unsupportedVersion(received: version)
+            }
             let streamId = Self.readUInt32BE(buffer, offset: base + 8)
             let payload = Array(buffer[(base + LinkProtocolConstants.headerSize)..<(base + totalFrameSize)])
 

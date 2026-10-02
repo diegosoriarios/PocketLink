@@ -12,12 +12,19 @@ import com.diego.pocketlink.connection.ConnectionService
 import com.diego.pocketlink.connection.ConnectionState
 import com.diego.pocketlink.connection.QrPairingPayload
 import com.diego.pocketlink.discovery.DiscoveredDevice
+import com.diego.pocketlink.files.TransferDirection
+import com.diego.pocketlink.files.TransferHistoryEntry
+import com.diego.pocketlink.files.TransferHistoryStore
 import com.diego.pocketlink.files.TransferProgress
+import com.diego.pocketlink.files.TransferState
+import com.diego.pocketlink.mirroring.MirroringService
 import com.diego.pocketlink.notifications.LinkNotificationListenerService
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -33,12 +40,22 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
 
     private val _batteryStatus = MutableStateFlow<BatteryStatus?>(null)
     val batteryStatus: StateFlow<BatteryStatus?> = _batteryStatus.asStateFlow()
+    private val _sendTransferProgress = MutableStateFlow<TransferProgress?>(null)
+    val sendTransferProgress: StateFlow<TransferProgress?> = _sendTransferProgress.asStateFlow()
 
-    private val _fileTransferProgress = MutableStateFlow<TransferProgress?>(null)
-    val fileTransferProgress: StateFlow<TransferProgress?> = _fileTransferProgress.asStateFlow()
+    private val _receiveTransferProgress = MutableStateFlow<TransferProgress?>(null)
+    val receiveTransferProgress: StateFlow<TransferProgress?> = _receiveTransferProgress.asStateFlow()
+
+    private val historyStore: TransferHistoryStore = TransferHistoryStore.get(application)
+    val transferHistory: StateFlow<List<TransferHistoryEntry>> = historyStore.entries
 
     private val _isNotificationListenerGranted = MutableStateFlow(false)
     val isNotificationListenerGranted: StateFlow<Boolean> = _isNotificationListenerGranted.asStateFlow()
+
+    private val _clipboardAutoSend = MutableStateFlow(
+        ConnectionService.isClipboardAutoSendEnabled(application)
+    )
+    val clipboardAutoSend: StateFlow<Boolean> = _clipboardAutoSend.asStateFlow()
 
     private val _logs = MutableStateFlow<List<String>>(emptyList())
     val logs: StateFlow<List<String>> = _logs.asStateFlow()
@@ -62,39 +79,41 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private fun observeServiceState() {
+        // ConnectionService exposes stable process-level flows that survive
+        // service stop/start cycles, so a single collect per flow is enough.
         viewModelScope.launch {
-            while (true) {
-                ConnectionService.connectionStateFlow?.collect { state ->
-                    _uiState.value = state
+            ConnectionService.connectionStateFlow.collect { state ->
+                _uiState.value = state
+                if (state is ConnectionState.Connected) {
+                    processShareQueue()
                 }
-                delay(500)
             }
         }
 
         viewModelScope.launch {
-            while (true) {
-                ConnectionService.eventsFlow?.collect { event ->
-                    addLog(event)
-                }
-                delay(500)
+            ConnectionService.eventsFlow.collect { event ->
+                addLog(event)
             }
         }
 
         viewModelScope.launch {
-            while (true) {
-                ConnectionService.discoveredDevicesFlow?.collect { devices ->
-                    _discoveredDevices.value = devices
-                }
-                delay(500)
+            ConnectionService.discoveredDevicesFlow.collect { devices ->
+                _discoveredDevices.value = devices
             }
         }
 
         viewModelScope.launch {
-            while (true) {
-                ConnectionService.transferProgressFlow?.collect { progress ->
-                    _fileTransferProgress.value = progress
+            ConnectionService.sendTransferProgressFlow.collect { progress ->
+                _sendTransferProgress.value = progress
+                if (progress?.state?.isTerminal == true) {
+                    processShareQueue()
                 }
-                delay(200)
+            }
+        }
+
+        viewModelScope.launch {
+            ConnectionService.receiveTransferProgressFlow.collect { progress ->
+                _receiveTransferProgress.value = progress
             }
         }
 
@@ -130,9 +149,60 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         ConnectionService.sendFile(uri)
     }
 
-    fun cancelFileTransfer() {
-        ConnectionService.cancelFileTransfer()
-        addLog(ConnectionEvent(message = "File transfer cancelled by user"))
+    private val pendingShareUris = ArrayDeque<Uri>()
+    private var isSendingShareQueue = false
+
+    fun sendSharedFiles(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        pendingShareUris.addAll(uris)
+        startService()
+        addLog(ConnectionEvent(message = "Queued ${uris.size} shared file(s) for transfer"))
+        processShareQueue()
+    }
+
+    private fun processShareQueue() {
+        if (isSendingShareQueue || pendingShareUris.isEmpty()) return
+        if (_uiState.value !is ConnectionState.Connected) return
+        val currentState = _sendTransferProgress.value?.state
+        if (currentState == TransferState.IN_PROGRESS || currentState == TransferState.VERIFYING) return
+
+        val next = pendingShareUris.removeFirst()
+        isSendingShareQueue = true
+        addLog(ConnectionEvent(message = "Sending shared file (${pendingShareUris.size + 1} queued)"))
+        sendFile(next)
+        viewModelScope.launch {
+            _sendTransferProgress
+                .filter { it?.state?.isTerminal == true }
+                .first()
+            isSendingShareQueue = false
+            if (pendingShareUris.isEmpty()) {
+                addLog(ConnectionEvent(message = "All shared files processed"))
+            }
+            processShareQueue()
+        }
+    }
+
+    fun cancelFileTransfer(direction: TransferDirection) {
+        ConnectionService.cancelFileTransfer(direction)
+        addLog(ConnectionEvent(message = "File transfer (${direction.name.lowercase()}) cancelled by user"))
+    }
+
+    fun dismissFileTransfer(direction: TransferDirection) {
+        ConnectionService.dismissFileTransfer(direction)
+    }
+
+    fun clearTransferHistory() {
+        historyStore.clear()
+    }
+
+    fun setClipboardAutoSend(enabled: Boolean) {
+        _clipboardAutoSend.value = enabled
+        ConnectionService.setClipboardAutoSend(getApplication(), enabled)
+        addLog(
+            ConnectionEvent(
+                message = if (enabled) "Clipboard auto-send enabled" else "Clipboard auto-send disabled"
+            )
+        )
     }
 
     fun syncClipboardNow() {
@@ -144,6 +214,16 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun startMirroring() {
+        addLog(ConnectionEvent(message = "Requesting screen mirroring consent"))
+        ConnectionService.requestMirrorConsent(getApplication())
+    }
+
+    fun stopMirroring() {
+        addLog(ConnectionEvent(message = "Stopping screen mirroring"))
+        MirroringService.stop(getApplication())
+    }
+
     fun sendPing() {
         val success = ConnectionService.sendPing()
         if (!success) {
@@ -151,10 +231,19 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun isIgnoringBatteryOptimizations(): Boolean {
+        return ConnectionService.isIgnoringBatteryOptimizations(getApplication())
+    }
+
+    fun requestIgnoreBatteryOptimizations(activity: android.app.Activity) {
+        addLog(ConnectionEvent(message = "Requesting exemption from battery optimizations"))
+        ConnectionService.requestIgnoreBatteryOptimizations(activity)
+    }
+
     fun onQrScanned(raw: String) {
-        val token = QrPairingPayload.parse(raw)
-        if (token != null) {
-            ConnectionService.setPendingPairingToken(token)
+        val pairing = QrPairingPayload.parse(raw)
+        if (pairing != null) {
+            ConnectionService.setPendingPairingToken(pairing)
             addLog(ConnectionEvent(message = "Scanned pairing QR code. Waiting for Mac handshake..."))
         } else {
             addLog(ConnectionEvent(message = "Unrecognized QR payload: $raw"))

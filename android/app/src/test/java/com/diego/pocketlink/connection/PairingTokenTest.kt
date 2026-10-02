@@ -10,52 +10,68 @@ class PairingTokenTest {
 
     @Test
     fun testQrPairingPayloadParseValid() {
-        val raw = "pocketlink://pair?v=1&t=abcdef1234567890ghijkl"
-        val token = QrPairingPayload.parse(raw)
-        assertEquals("abcdef1234567890ghijkl", token)
+        val raw = "pocketlink://pair?v=2&t=abcdef1234567890ghijkl"
+        val pairing = QrPairingPayload.parse(raw)
+        assertEquals("abcdef1234567890ghijkl", pairing?.token)
+        assertNull(pairing?.identityFingerprint)
     }
 
     @Test
     fun testQrPairingPayloadParseWithTrailingWhitespace() {
-        val raw = "  pocketlink://pair?v=1&t=abcdef1234567890ghijkl \n "
+        val raw = "  pocketlink://pair?v=2&t=abcdef1234567890ghijkl \n "
         val token = QrPairingPayload.parse(raw)
-        assertEquals("abcdef1234567890ghijkl", token)
+        assertEquals("abcdef1234567890ghijkl", token?.token)
     }
 
     @Test
     fun testQrPairingPayloadParseReorderedQueryParameters() {
-        val raw = "pocketlink://pair?t=abcdef1234567890ghijkl&v=1"
+        val raw = "pocketlink://pair?t=abcdef1234567890ghijkl&v=2"
         val token = QrPairingPayload.parse(raw)
-        assertEquals("abcdef1234567890ghijkl", token)
+        assertEquals("abcdef1234567890ghijkl", token?.token)
+    }
+
+    @Test
+    fun testQrPairingPayloadParseWithIdentityFingerprint() {
+        val raw = "pocketlink://pair?v=2&t=abcdef1234567890ghijkl&k=0123abcd"
+        val pairing = QrPairingPayload.parse(raw)
+        assertEquals("abcdef1234567890ghijkl", pairing?.token)
+        assertEquals("0123abcd", pairing?.identityFingerprint)
+    }
+
+    @Test
+    fun testQrPairingPayloadParseFingerprintOutOfOrder() {
+        val raw = "pocketlink://pair?k=0123abcd&t=abcdef1234567890ghijkl&v=2"
+        val pairing = QrPairingPayload.parse(raw)
+        assertEquals("0123abcd", pairing?.identityFingerprint)
     }
 
     @Test
     fun testQrPairingPayloadParseWrongScheme() {
-        val raw = "https://pair?v=1&t=abcdef1234567890ghijkl"
+        val raw = "https://pair?v=2&t=abcdef1234567890ghijkl"
         assertNull(QrPairingPayload.parse(raw))
     }
 
     @Test
     fun testQrPairingPayloadParseWrongHost() {
-        val raw = "pocketlink://connect?v=1&t=abcdef1234567890ghijkl"
+        val raw = "pocketlink://connect?v=2&t=abcdef1234567890ghijkl"
         assertNull(QrPairingPayload.parse(raw))
     }
 
     @Test
     fun testQrPairingPayloadParseWrongVersion() {
-        val raw = "pocketlink://pair?v=2&t=abcdef1234567890ghijkl"
+        val raw = "pocketlink://pair?v=1&t=abcdef1234567890ghijkl"
         assertNull(QrPairingPayload.parse(raw))
     }
 
     @Test
     fun testQrPairingPayloadParseMissingToken() {
-        val raw = "pocketlink://pair?v=1"
+        val raw = "pocketlink://pair?v=2"
         assertNull(QrPairingPayload.parse(raw))
     }
 
     @Test
     fun testQrPairingPayloadParseBlankToken() {
-        val raw = "pocketlink://pair?v=1&t=  "
+        val raw = "pocketlink://pair?v=2&t=  "
         assertNull(QrPairingPayload.parse(raw))
     }
 
@@ -75,5 +91,13 @@ class PairingTokenTest {
 
         // Past 5 minutes (e.g. 300,001 ms)
         assertTrue(token.isExpired(startMs + 300001L))
+    }
+
+    @Test
+    fun testPendingPairingTokenCarriesFingerprint() {
+        val token = PendingPairingToken(value = "t", identityFingerprint = "abc123")
+        assertEquals("abc123", token.identityFingerprint)
+        val legacy = PendingPairingToken(value = "t")
+        assertNull(legacy.identityFingerprint)
     }
 }
