@@ -7,29 +7,33 @@ import android.os.Build
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import com.diego.pocketlink.protocol.MirrorProtocol
+import kotlin.math.hypot
 
 /**
  * Injects remote touch gestures. Enabled manually by the user in system
  * settings (side-loaded usage only; not compliant with Play policy if
  * distributed).
  *
- * Builds one continuous [GestureDescription.StrokeDescription] per touch
- * sequence: "down" starts the stroke, "move" continues it, "up" finishes it.
+ * Buffers the points of one touch sequence and dispatches a single gesture
+ * on "up": a short tap when the pointer barely moved, otherwise one
+ * continuous stroke through all buffered points. Dispatching one gesture
+ * per sequence avoids preemption and too-short strokes, which MIUI
+ * launchers tend to drop.
  */
 class MirroringAccessibilityService : AccessibilityService() {
 
-    private var pendingStroke: GestureDescription.StrokeDescription? = null
-    private var lastX = 0f
-    private var lastY = 0f
+    private val strokePoints = mutableListOf<Pair<Float, Float>>()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        _enabledFlow.value = true
         Log.d(TAG, "Accessibility service connected")
     }
 
     override fun onDestroy() {
         instance = null
+        _enabledFlow.value = false
         super.onDestroy()
     }
 
@@ -44,73 +48,79 @@ class MirroringAccessibilityService : AccessibilityService() {
 
         try {
             when (action) {
-                MirrorProtocol.ACTION_DOWN -> beginStroke(x, y)
-                MirrorProtocol.ACTION_MOVE -> continueStroke(x, y)
+                MirrorProtocol.ACTION_DOWN -> startStroke(x, y)
+                MirrorProtocol.ACTION_MOVE -> strokePoints.add(x to y)
                 MirrorProtocol.ACTION_UP -> finishStroke(x, y)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Gesture dispatch failed: ${e.message}")
-            pendingStroke = null
+            strokePoints.clear()
         }
     }
 
-    private fun beginStroke(x: Float, y: Float) {
-        val path = Path().apply { moveTo(x, y) }
-        val stroke = GestureDescription.StrokeDescription(path, 0, STROKE_DOWN_DURATION_MS, true)
-        dispatch(GestureDescription.Builder().addStroke(stroke).build())
-        pendingStroke = stroke
-        lastX = x
-        lastY = y
-    }
-
-    private fun continueStroke(x: Float, y: Float) {
-        val previous = pendingStroke ?: return
-        val path = Path().apply {
-            moveTo(lastX, lastY)
-            lineTo(x, y)
-        }
-        val stroke = previous.continueStroke(path, 0, STROKE_MOVE_DURATION_MS, true)
-        dispatch(GestureDescription.Builder().addStroke(stroke).build())
-        pendingStroke = stroke
-        lastX = x
-        lastY = y
+    private fun startStroke(x: Float, y: Float) {
+        strokePoints.clear()
+        strokePoints.add(x to y)
     }
 
     private fun finishStroke(x: Float, y: Float) {
-        val previous = pendingStroke
-        pendingStroke = null
-        if (previous == null) {
-            // Tap without a prior down: short tap at the final position.
-            val path = Path().apply { moveTo(x, y) }
-            dispatch(
-                GestureDescription.Builder()
-                    .addStroke(GestureDescription.StrokeDescription(path, 0, STROKE_TAP_DURATION_MS))
-                    .build()
-            )
-            return
-        }
+        strokePoints.add(x to y)
+        val points = strokePoints.toList()
+        strokePoints.clear()
+        if (points.isEmpty()) return
+
+        val (firstX, firstY) = points.first()
+        val last = points.last()
+        val displacement = hypot(
+            (last.first - firstX).toDouble(),
+            (last.second - firstY).toDouble()
+        )
+
         val path = Path().apply {
-            moveTo(lastX, lastY)
-            lineTo(x, y)
+            moveTo(firstX, firstY)
+            for (i in 1 until points.size) {
+                lineTo(points[i].first, points[i].second)
+            }
         }
-        val stroke = previous.continueStroke(path, 0, STROKE_UP_DURATION_MS, false)
-        dispatch(GestureDescription.Builder().addStroke(stroke).build())
+        val durationMs = if (displacement < TAP_SLOP_PX) {
+            TAP_DURATION_MS
+        } else {
+            (points.size * 33L).coerceIn(MIN_DRAG_DURATION_MS, MAX_DRAG_DURATION_MS)
+        }
+        dispatch(
+            GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs))
+                .build()
+        )
     }
 
     private fun dispatch(description: GestureDescription) {
-        dispatchGesture(description, null, null)
+        dispatchGesture(
+            description,
+            object : GestureResultCallback() {
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    Log.w(TAG, "Gesture dispatch cancelled by the system")
+                }
+            },
+            null
+        )
     }
 
     companion object {
         private const val TAG = "MirroringA11yService"
-        private const val STROKE_DOWN_DURATION_MS = 16L
-        private const val STROKE_MOVE_DURATION_MS = 16L
-        private const val STROKE_UP_DURATION_MS = 16L
-        private const val STROKE_TAP_DURATION_MS = 80L
+        private const val TAP_SLOP_PX = 24.0
+        private const val TAP_DURATION_MS = 120L
+        private const val MIN_DRAG_DURATION_MS = 200L
+        private const val MAX_DRAG_DURATION_MS = 1200L
 
         @Volatile
         var instance: MirroringAccessibilityService? = null
             private set
+
+        private val _enabledFlow = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+        /** True while the user has enabled (and the system has bound) this service. */
+        val enabledFlow: kotlinx.coroutines.flow.StateFlow<Boolean> = _enabledFlow
 
         val isEnabled: Boolean
             get() = instance != null

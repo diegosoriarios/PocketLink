@@ -2,7 +2,9 @@ package com.diego.pocketlink.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.provider.Settings
 import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -27,6 +29,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -268,6 +271,51 @@ private fun MirroringCard(
                 ) {
                     Text("Start Mirroring")
                 }
+            }
+            RemoteControlRow()
+        }
+    }
+}
+
+@Composable
+private fun RemoteControlRow() {
+    val remoteControlEnabled by com.diego.pocketlink.mirroring.MirroringAccessibilityService
+        .enabledFlow.collectAsState()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    HorizontalDivider(color = Color.LightGray.copy(alpha = 0.4f))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "Remote control",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = if (remoteControlEnabled) {
+                    "On — the Mac can tap and swipe on this device."
+                } else {
+                    "Off — enable it so the Mac can control this device."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
+            )
+        }
+        if (remoteControlEnabled) {
+            Text(
+                text = "On",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(0xFF1B873B),
+                fontWeight = FontWeight.Bold
+            )
+        } else {
+            OutlinedButton(onClick = {
+                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }) {
+                Text("Enable")
             }
         }
     }
