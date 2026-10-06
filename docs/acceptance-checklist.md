@@ -26,7 +26,7 @@ Unit-suite baselines at time of writing: Swift 121/121, Android 61/61.
   - [ ] **Camera** (needed by the QR scanner card)
   - [ ] **Notifications** (API 33+ runtime prompt)
   - [ ] **Notification Listener access** — "Notification Forwarding" card → *Enable Notification Access* (system Settings toggle)
-  - [ ] **Accessibility** — "PocketLink Remote Control" enabled in system Settings (needed for touch injection later)
+  - [x] **Accessibility** — "PocketLink Remote Control" enabled in system Settings (needed for touch injection later)
   - [ ] **Background keep-alive** — battery-optimization whitelist button in "Clipboard & Battery Synchronization" card
 - [ ] Note the phone's Wi-Fi IP from the Connection Engine card: ______________
 
@@ -145,8 +145,8 @@ Run with the paired/trusted state from Phase 1.
 | 2.8 | File cancel (sender) | Start a large file send → cancel mid-transfer | Both UIs show `CANCELLED`; partial file discarded on the receiver; connection survives | ☐ |
 | 2.9 | Share sheet | Android system share → PocketLink (while connected) | File queued and sent after connect | ☐ |
 | 2.10 | Battery | Toggle phone charging / power save | Mac battery caption + SF Symbol update | ☐ |
-| 2.11 | Mirroring | **Mirror phone screen** on Mac → accept MediaProjection on phone | Mirror window shows the screen; fps stats caption; **Stop mirroring** works from both sides | ☐ |
-| 2.12 | Touch injection | With mirroring active, tap/swipe in the mirror window | Phone reacts; requires the Accessibility service enabled in setup | ☐ |
+| 2.11 | Mirroring | **Mirror phone screen** on Mac → accept MediaProjection on phone | Mirror window shows the screen; fps stats caption; **Stop mirroring** works from both sides | ✓ |
+| 2.12 | Touch injection | With mirroring active, tap/swipe in the mirror window | Phone reacts; requires the Accessibility service enabled in setup | ✓ |
 | 2.13 | Sleep/wake | Let the Mac sleep ~30 s, wake it | Clean disconnect on sleep; session auto-resumes on wake; PING healthy again | ☐ |
 | 2.14 | Heartbeat kill | Enable airplane mode on the phone for ~1 min → off | Mac detects loss via missed PONGs (no hang), then auto-reconnects | ☐ |
 
@@ -157,7 +157,9 @@ Run with the paired/trusted state from Phase 1.
 | Phase | Pass | Fail | Notes |
 |---|---|---|---|
 | 1.1–1.6 crypto | | | |
-| 2.1–2.14 features | | | |
+| 2.1–2.14 features | 2.11, 2.12 | | Mirroring + touch injection verified live (2026-10-06). Touch injection required
+  `android:canPerformGestures="true"` in the service XML (MIUI silently ignores gestures without it);
+  reinstall/updates revoke the Accessibility toggle — re-enable via the in-app Remote control row. |
 
 Failures → capture: phone Event Log screenshot/copy, Mac `lastDeviceError`
 caption, `adb logcat` tail, and the exact step number. Then fix → rebuild →
