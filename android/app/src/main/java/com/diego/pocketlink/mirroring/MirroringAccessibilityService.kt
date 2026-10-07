@@ -4,18 +4,25 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.os.Build
+import android.os.Bundle
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import com.diego.pocketlink.protocol.MirrorProtocol
 import kotlin.math.hypot
 
 /**
- * Injects remote touch gestures. Enabled manually by the user in system
- * settings (side-loaded usage only; not compliant with Play policy if
- * distributed).
+ * Injects remote touch gestures and remote keyboard text. Enabled manually by
+ * the user in system settings (side-loaded usage only; not compliant with
+ * Play policy if distributed).
  *
- * Buffers the points of one touch sequence and dispatches a single gesture
- * on "up": a short tap when the pointer barely moved, otherwise one
+ * Text goes through ACTION_SET_TEXT on the focused editable node: committed
+ * batches are appended verbatim, backspace is a read-modify-write that drops
+ * the last code point, enter inserts a newline. Best-effort per the known
+ * IME/field flakiness — the clipboard push remains the fallback path.
+ *
+ * Touch: buffers the points of one touch sequence and dispatches a single
+ * gesture on "up": a short tap when the pointer barely moved, otherwise one
  * continuous stroke through all buffered points. Dispatching one gesture
  * per sequence avoids preemption and too-short strokes, which MIUI
  * launchers tend to drop.
@@ -40,6 +47,53 @@ class MirroringAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
     override fun onInterrupt() {}
+
+    fun handleText(text: String) {
+        mutateFocusedEditable { current -> current + text }
+    }
+
+    fun handleSpecial(special: String) {
+        when (special) {
+            SPECIAL_BACKSPACE -> mutateFocusedEditable { current ->
+                if (current.isEmpty()) null
+                else current.substring(0, current.offsetByCodePoints(current.length, -1))
+            }
+            SPECIAL_ENTER -> handleText("\n")
+        }
+    }
+
+    /**
+     * Read-modify-write on the focused editable node via ACTION_SET_TEXT.
+     * Returning null from [transform] leaves the field untouched (e.g.
+     * backspace on an empty field).
+     */
+    private fun mutateFocusedEditable(transform: (String) -> String?) {
+        try {
+            val root = rootInActiveWindow ?: run {
+                Log.d(TAG, "No active window for text injection")
+                return
+            }
+            val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: run {
+                Log.d(TAG, "No focused node for text injection")
+                return
+            }
+            if (!node.isEditable) {
+                Log.d(TAG, "Focused node is not editable; ignoring text")
+                return
+            }
+            val current = node.text?.toString() ?: ""
+            val updated = transform(current) ?: return
+            val arguments = Bundle().apply {
+                putCharSequence(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                    updated
+                )
+            }
+            node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+        } catch (e: Exception) {
+            Log.w(TAG, "Text injection failed: ${e.message}")
+        }
+    }
 
     fun handleTouch(action: String, xNorm: Double, yNorm: Double) {
         val metrics = resources.displayMetrics
@@ -108,6 +162,8 @@ class MirroringAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "MirroringA11yService"
+        private const val SPECIAL_BACKSPACE = "backspace"
+        private const val SPECIAL_ENTER = "enter"
         private const val TAP_SLOP_PX = 24.0
         private const val TAP_DURATION_MS = 120L
         private const val MIN_DRAG_DURATION_MS = 200L
@@ -127,6 +183,14 @@ class MirroringAccessibilityService : AccessibilityService() {
 
         fun dispatchTouch(action: String, xNorm: Double, yNorm: Double) {
             instance?.handleTouch(action, xNorm, yNorm)
+        }
+
+        /** Exactly one of [text]/[special] is non-null (REMOTE_TEXT payload). */
+        fun dispatchText(text: String?, special: String?) {
+            when {
+                text != null -> instance?.handleText(text)
+                special != null -> instance?.handleSpecial(special)
+            }
         }
     }
 }

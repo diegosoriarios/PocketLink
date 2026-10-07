@@ -62,6 +62,13 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
 
     private val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
+    // Declared BEFORE init: viewModelScope uses Dispatchers.Main.immediate, so
+    // a Connected state flow emission can run processShareQueue synchronously
+    // during construction (crashed with an NPE when these were initialized
+    // after the init block).
+    private val pendingShareUris = ArrayDeque<Uri>()
+    private var isSendingShareQueue = false
+
     init {
         observeServiceState()
         checkNotificationListenerPermission()
@@ -148,9 +155,6 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         addLog(ConnectionEvent(message = "Initiating file send for selected URI"))
         ConnectionService.sendFile(uri)
     }
-
-    private val pendingShareUris = ArrayDeque<Uri>()
-    private var isSendingShareQueue = false
 
     fun sendSharedFiles(uris: List<Uri>) {
         if (uris.isEmpty()) return

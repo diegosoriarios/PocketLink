@@ -22,9 +22,11 @@ enum class MessageType(val id: UShort) {
     MIRROR_CONFIG(0x0052u),
     MIRROR_FRAME(0x0053u),
     REMOTE_TOUCH(0x0054u),
+    REMOTE_TEXT(0x0064u),
     CRYPTO_M1(0x0060u),
     CRYPTO_M2(0x0061u),
-    CRYPTO_M3(0x0062u);
+    CRYPTO_M3(0x0062u),
+    OPEN_URL(0x0065u);
 
     /** True for Noise handshake frames (CRYPTO_M1/M2/M3). */
     val isCryptoHandshake: Boolean

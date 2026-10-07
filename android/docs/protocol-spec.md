@@ -68,9 +68,11 @@ Every frame begins with a fixed 16-byte header:
 | `0x0052` | `MIRROR_CONFIG` | UTF-8 JSON | Phone→Mac video parameters + H.264 SPS/PPS (base64 Annex-B) |
 | `0x0053` | `MIRROR_FRAME` | Binary | `u64 tsMs \| u8 keyframe \| u32 len \| Annex-B access unit` |
 | `0x0054` | `REMOTE_TOUCH` | UTF-8 JSON | Mac→phone touch injection (`{"action","x","y"}` normalized) |
+| `0x0064` | `REMOTE_TEXT` | UTF-8 JSON | Mac→phone keyboard injection: `{"text": "<non-empty str>"}` or `{"special": "backspace"\|"enter"}` (exactly one key) — appended to the focused editable node via `ACTION_SET_TEXT` (best-effort; no ACK in v1) |
 | `0x0060` | `CRYPTO_M1` | Binary | Noise XX `-> e`: 32 B initiator ephemeral key |
 | `0x0061` | `CRYPTO_M2` | Binary | Noise XX `<- e, ee, s, es`: 80 B + 112 B encrypted identity payload |
 | `0x0062` | `CRYPTO_M3` | Binary | Noise XX `-> s, se`: 48 B + 112 B encrypted identity payload |
+| `0x0065` | `OPEN_URL` | UTF-8 JSON | Mac→phone; `{"url": "<str>"}` — phone opens it via implicit `ACTION_VIEW` (http/https only; no ACK in v1) |
 
 ---
 

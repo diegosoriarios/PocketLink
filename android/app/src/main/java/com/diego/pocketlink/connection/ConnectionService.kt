@@ -137,6 +137,12 @@ class ConnectionService : Service() {
         manager.onRemoteTouchReceived = { action, x, y ->
             MirroringAccessibilityService.dispatchTouch(action, x, y)
         }
+        manager.onRemoteTextReceived = { text, special ->
+            MirroringAccessibilityService.dispatchText(text, special)
+        }
+        manager.onOpenUrlReceived = { url ->
+            openOnPhone(url)
+        }
 
         instance = this
     }
@@ -161,6 +167,21 @@ class ConnectionService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /** Opens a Mac-sent URL via an implicit ACTION_VIEW (http/https only). */
+    private fun openOnPhone(url: String) {
+        val uri = Uri.parse(url)
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") {
+            android.util.Log.w(TAG, "Ignoring OPEN_URL with non-http(s) scheme: $url")
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { startActivity(intent) }
+            .onFailure { android.util.Log.w(TAG, "Could not open URL: ${it.message}") }
+    }
 
     override fun onDestroy() {
         clipboardSyncManager?.stopListening()
@@ -268,6 +289,8 @@ class ConnectionService : Service() {
     companion object {
         const val CHANNEL_ID = "link_connection_channel"
         const val NOTIFICATION_ID = 1001
+
+        private const val TAG = "ConnectionService"
 
         const val ACTION_START = "com.diego.pocketlink.action.START_SERVICE"
         const val ACTION_STOP = "com.diego.pocketlink.action.STOP_SERVICE"

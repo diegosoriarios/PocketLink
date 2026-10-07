@@ -84,6 +84,8 @@ class ConnectionManager(
     var onMirrorStartRequested: (() -> Unit)? = null
     var onMirrorStopRequested: (() -> Unit)? = null
     var onRemoteTouchReceived: ((action: String, x: Double, y: Double) -> Unit)? = null
+    var onRemoteTextReceived: ((text: String?, special: String?) -> Unit)? = null
+    var onOpenUrlReceived: ((url: String) -> Unit)? = null
     var fileTransferEngine: FileTransferEngine? = null
 
     private var pendingClipboardAckTimestamp: Long = -1
@@ -464,6 +466,35 @@ class ConnectionManager(
                     }
                 } catch (e: Exception) {
                     logEvent("Failed to parse REMOTE_TOUCH payload: ${e.message}")
+                }
+            }
+            MessageType.REMOTE_TEXT -> {
+                try {
+                    val json = JSONObject(frame.payload.toString(Charsets.UTF_8))
+                    val special = json.optString("special").takeIf { it.isNotBlank() }
+                    val text = json.optString("text").takeIf { it.isNotBlank() }
+                    if (special != null || text != null) {
+                        logEvent("Received REMOTE_TEXT frame (${text?.length ?: 0} chars, special: $special)")
+                        onRemoteTextReceived?.invoke(text, special)
+                    } else {
+                        logEvent("Ignored invalid REMOTE_TEXT payload")
+                    }
+                } catch (e: Exception) {
+                    logEvent("Failed to parse REMOTE_TEXT payload: ${e.message}")
+                }
+            }
+            MessageType.OPEN_URL -> {
+                try {
+                    val json = JSONObject(frame.payload.toString(Charsets.UTF_8))
+                    val url = json.optString("url")
+                    if (url.isNotBlank()) {
+                        logEvent("Received OPEN_URL frame: $url")
+                        onOpenUrlReceived?.invoke(url)
+                    } else {
+                        logEvent("Ignored OPEN_URL frame with blank url")
+                    }
+                } catch (e: Exception) {
+                    logEvent("Failed to parse OPEN_URL payload: ${e.message}")
                 }
             }
             MessageType.BATTERY -> {
