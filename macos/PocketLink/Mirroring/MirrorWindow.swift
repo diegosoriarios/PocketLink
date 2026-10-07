@@ -4,11 +4,17 @@ import LinkProtocol
 
 /// Layer-backed view that installs the decoder's display layer, keeps it
 /// aspect-fitted, and forwards mouse events as normalized video-space points.
+/// Clicking focuses the view; typed keys are then forwarded to the phone as
+/// REMOTE_TEXT batches (committed text, ~100 ms) and specials (backspace,
+/// enter).
 final class TouchForwardingView: NSView {
     var onGesture: ((MirrorMessages.TouchAction, CGPoint) -> Void)?
+    var onRemoteText: ((MirrorMessages.TextContent) -> Void)?
 
     private var videoAspect: CGFloat = 9.0 / 19.5
     private var isTracking = false
+    private var pendingText = ""
+    private var textFlushTask: Task<Void, Never>?
 
     func install(_ videoLayer: AVSampleBufferDisplayLayer) {
         wantsLayer = true
@@ -55,6 +61,7 @@ final class TouchForwardingView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard let videoPoint = normalizedVideoPoint(at: point) else { return }
+        window?.makeFirstResponder(self)
         isTracking = true
         onGesture?(.down, videoPoint)
     }
@@ -75,9 +82,60 @@ final class TouchForwardingView: NSView {
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    // MARK: - Keyboard forwarding (REMOTE_TEXT)
+
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Let hardware shortcuts (Cmd+C, Ctrl+…, media keys) keep working.
+        guard !flags.contains(.command), !flags.contains(.control) else {
+            super.keyDown(with: event)
+            return
+        }
+        switch event.keyCode {
+        case 51: // delete
+            flushPendingText()
+            onRemoteText?(.special(.backspace))
+            return
+        case 36, 76: // return, keypad enter
+            flushPendingText()
+            onRemoteText?(.special(.enter))
+            return
+        default:
+            break
+        }
+        guard let characters = event.characters, !characters.isEmpty else { return }
+        let text = characters.filter { character in
+            character.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+        }
+        guard !text.isEmpty else { return }
+        pendingText += text
+        scheduleTextFlush()
+    }
+
+    private func scheduleTextFlush() {
+        textFlushTask?.cancel()
+        textFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self, !Task.isCancelled else { return }
+            self.flushPendingText()
+        }
+    }
+
+    private func flushPendingText() {
+        textFlushTask?.cancel()
+        textFlushTask = nil
+        guard !pendingText.isEmpty else { return }
+        let text = pendingText
+        pendingText = ""
+        onRemoteText?(.text(text))
+    }
 }
 
-/// Window controller hosting the mirrored video surface.
+/// Window controller used to pop the mirrored video surface out of the
+/// menu bar panel into a standalone window.
 final class MirrorWindowController: NSWindowController, NSWindowDelegate {
     var onWindowClosed: (() -> Void)?
 

@@ -20,9 +20,11 @@ public enum MessageType: UInt16, Sendable, CaseIterable {
     case mirrorConfig = 0x0052
     case mirrorFrame = 0x0053
     case remoteTouch = 0x0054
+    case remoteText = 0x0064
     case cryptoM1 = 0x0060
     case cryptoM2 = 0x0061
     case cryptoM3 = 0x0062
+    case openURL = 0x0065
 
     public init?(id: UInt16) {
         self.init(rawValue: id)

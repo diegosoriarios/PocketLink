@@ -1,6 +1,6 @@
 # PocketLink — Master Plan
 
-Last updated: 2026-09-30.
+Last updated: 2026-10-07.
 This file consolidates and supersedes `planning.md` and `next-steps.md`.
 Source of truth for the byte-exact wire protocol: [`macos/docs/PROTOCOL.md`](macos/docs/PROTOCOL.md)
 (mirrored in [`android/docs/protocol-spec.md`](android/docs/protocol-spec.md)).
@@ -243,6 +243,157 @@ Everything else is roadmap, below.
   TODO; empty macOS placeholder folders (`Clipboard/`, `Files/`,
   `Mirroring/`, `Notifications/`) — delete or fill.
 
+### Phase D — Planned (2026-10-07): menu bar polish, mirroring v2, sharing
+
+Wire changes this phase (both protocol docs + both decoders in the same change,
+per §2): new Mac→phone types REMOTE_TEXT 0x0064 (`{"text": "…", "special"?
+: "backspace"|"enter"}`) and OPEN_URL 0x0065 (`{"url": "…"}`), JSON payloads,
+sealed like all post-C1 frames. Next free codes after crypto's 0x0060–62.
+
+- **D1 · Menu bar & system integration (Mac-only, no wire changes).**
+  - **D1.1 Launch at login.** ✅ DONE (2026-10-07) — `SMAppService.mainApp`
+    checkbox in the panel footer ("Launch at login", under a divider above
+    Quit); `ConnectionViewModel.setLaunchAtLogin` registers/unregisters and
+    surfaces errors as panel status text ("Launch at login failed: …").
+    *Design note:* the plan originally mirrored the flag into
+    `settings.json`, but implementation uses `SMAppService.status` as the
+    single source of truth (refreshed on init and after every toggle) — a
+    settings.json copy would desync when the user removes the login item
+    via System Settings. `.requiresApproval` state shows "Approve PocketLink
+    in System Settings → Login Items to activate." Also cleaned 5
+    pre-existing unused-`client` binding warnings in `ConnectionViewModel`.
+  - **D1.2 Global shortcuts.** ✅ DONE (2026-10-07) —
+    `App/GlobalHotKeys.swift`: Carbon `RegisterEventHotKey` + a single
+    `kEventHotKeyPressed` handler installed on the application event target
+    (no accessibility permission needed); dispatch keyed by `EventHotKeyID`
+    and hops to the main actor via `MainActor.assumeIsolated` (Carbon
+    delivers app events on the main thread). ⌥⌘M toggles the panel
+    (`StatusItemController.togglePanel`, shared with the button click and
+    its transient-reopen guard), ⌥⌘S calls `ConnectionViewModel.
+    toggleMirroring()` — same semantics as the panel button (starts only
+    when connected, cancels requesting/active). Key choices centralized as
+    `GlobalHotKeys.togglePanel` / `.toggleMirroring` statics; registration
+    failures drop the handler silently. Configurability remains a stretch.
+  - **D1.3 Unread badge on the icon.** ✅ DONE (2026-10-07) — red dot
+    (7 pt, `StatusItemBadgeDot`, click/drag-transparent via `hitTest → nil`)
+    at the top-trailing corner of the status item. Model tracks
+    `lastSeenNotificationDate` + `hasUnreadNotifications`, recomputed in a
+    central `updateNotifications` setter (receive, load, and clear paths);
+    seen-threshold = newest known postTime (never local "now" — phone
+    clocks can drift). `StatusItemController` marks seen on popover
+    will-show *and* did-close (arrivals while the panel was open count as
+    seen); pushes visibility to the dot via
+    `ConnectionViewModel.onUnreadNotificationsChanged` callback.
+  - **D1.4 Transfer progress on the icon.** ✅ DONE (2026-10-07) — 18 pt
+    template ring (`StatusItemController.progressImage`): 2 pt track at 30%
+    alpha + round-capped progress arc, redrawn as a template image so menu
+    bar tinting handles light/dark/highlighted. Aggregate fraction is
+    computed in `ConnectionViewModel.syncTransferProgress` (average across
+    sending/awaiting-ack outgoing + receiving incoming transfers; nil when
+    idle), invoked from the four transfer-mutation helpers
+    (`updateTransfer`, `upsertOutgoing`, `updateOutgoing`,
+    `updateOutgoingIfActive`), pushed via
+    `onTransferProgressChanged` with a 0.5% update threshold. Icon rendering
+    centralized in `refreshIcon()` with priority: drop hover > progress ring
+    > plain link icon.
+  - **D1.5 Low-battery alert.** ✅ DONE (2026-10-07) — pure decision logic
+    lives in LinkProtocol as `BatteryAlertAdvisor` (tested: fires once per
+    ≤15% low / ≤5% critical crossing, only while discharging, re-arms above
+    a 20% hysteresis band — suite now 130). `ConnectionViewModel` evaluates
+    it on every BATTERY frame and posts `UNUserNotificationCenter` local
+    notifications ("Phone battery low / critically low — N% remaining"),
+    requesting authorization lazily on first alert (`@preconcurrency` import
+    bridges the SDK's missing Sendable annotations);
+    `NotificationPresenter` (UNUserNotificationCenterDelegate in the app
+    delegate) keeps banners visible while the app is active; advisor state
+    resets on session teardown so a reconnect re-evaluates.
+
+- **D2 · Mirroring v2.**
+  - **D2.1 Keyboard forwarding (hardest item, do last).** ✅ DONE (2026-10-07)
+    — new `REMOTE_TEXT 0x0064` Mac→phone type, payload `{"text": "<non-empty
+    str>"}` or `{"special": "backspace"|"enter"}` (exactly one key); both
+    protocol docs updated. Mac: `TouchForwardingView` now accepts first
+    responder on click and forwards `keyDown` — printable text is batched
+    (~100 ms flush) into one `.text` frame, delete/return become `.special`
+    frames immediately, Cmd/Ctrl combos pass through to the responder chain
+    (5 new codec tests; suite 135). Android:
+    `MirroringAccessibilityService.dispatchText` → read-modify-write
+    `ACTION_SET_TEXT` on the input-focused editable node (code-point-safe
+    backspace; no-op logs when there is no focused editable). Best-effort per
+    §5 pitfall 5 — clipboard push stays the fallback; real-device pass
+    required (field/IME differences, `GLOBAL_ACTION_BACK`/`HOME` stretch
+    intentionally not done).
+  - **D2.2 Mirror screenshot & recording (Mac-local, no wire changes).**
+    ✅ DONE (2026-10-07) — `VideoDecoder` exposes an `onSampleBuffer` hook
+    (fired with each ready AVCC sample) plus `currentFormatDescription` and a
+    `screenshotPNG()` that renders the display layer into a `CGContext`
+    (current displayed frame; popover-independent). New `MirrorRecorder`
+    (@MainActor) wraps a passthrough `AVAssetWriter` (.mp4, `outputSettings:
+    nil` + `sourceFormatHint`, `expectsMediaDataInRealTime`, session started
+    at the first sample PTS; frames dropped when the input is full — same
+    drop-late policy as the display). ViewModel: record button starts/stops
+    (`Recordings/` in the support dir), screenshot button saves PNG into
+    `Screenshots/` and reveals it in Finder; session teardown finalizes any
+    open recording; stats loop drives a live "Recording · mm:ss" line
+    (`recordingStatusText`, separate from `mirrorStatusText` so the 1 s stats
+    refresh can't clobber it). Verified by build (warning-free) — real-device
+    pass recommended, especially the screenshot black-frame check.
+  - **D2.3 Paste-into-phone.** ✅ DONE (2026-10-07) — v1 shipped with the
+    clipboard-sync feature: the "Send clipboard to phone" button in the panel
+    pushes Mac pasteboard text via the existing CLIPBOARD type (with ACK +
+    "delivered"/"no confirmation" status), zero wire change. Auto-paste into
+    the focused phone field remains a stretch riding on D2.1
+    (`{"paste": true}`).
+
+- **D3 · Content sharing.**
+  - **D3.1 Multi-file drop queue.** ✅ DONE (2026-10-07) — new `.queued`
+    state on `OutgoingTransfer` (clock icon, "Queued · size", Cancel removes
+    the pending entry); `sendDroppedFiles` queues every dropped URL (rows
+    created reversed so the newest-first list reads in drop order) and
+    `drainPendingSends` feeds them one at a time through the existing
+    `sendFile` pipeline. Drain triggers: send-task defer, prepare failure,
+    awaiting-ack cancel, and both `.connected` transitions (queue survives
+    a drop + reconnect). `sendFile` itself routes into the queue when busy
+    instead of erroring, so picker sends and retries queue too. Queue is
+    keyed by row id (same file dropped twice stays independent); teardown
+    (`stopSession`) fails queued rows as "Disconnected". No wire changes;
+    app-target logic — verified by build, real-device pass recommended.
+  - **D3.2 Open on phone.** ✅ DONE (2026-10-07) — new `OPEN_URL 0x0065`
+    Mac→phone wire type, payload `{"url": "<str>"}`, sealed post-handshake
+    like all application frames; both protocol docs updated. Mac:
+    `OpenURLMessage` frame builder + parser in LinkProtocol, URL field +
+    "Open on phone" button in connected controls (Enter submits, disabled
+    when empty, http/https-only validation with transient status line
+    "Opening on phone…"). Android: `MessageType.OPEN_URL` +
+    `ConnectionManager` case → `onOpenUrlReceived` → `ConnectionService.
+    openOnPhone` fires implicit `ACTION_VIEW` with `FLAG_ACTIVITY_NEW_TASK`
+    (scheme re-validated http/https; failures logged). Tests: Swift
+    `OpenURLMessageTests` (payload, wire round-trip, foreign-type/empty-url
+    rejection — suite now 124); Android `OpenUrlMessageTest` (63 total).
+    No ACK in v1 — add one if real-device testing shows silent failures.
+  - **D3.3 Finder "Send with PocketLink" (Services).** ✅ DONE (2026-10-07)
+    — `NSServices` entry in Info.plist restricted to Finder
+    (`NSRequiredContext.NSApplicationIdentifier = com.apple.finder`) with
+    `NSSendFileTypes: public.item` and `NSMessage: sendFilesToPhone`;
+    `App/ServicesProvider.swift` implements the
+    `sendFilesToPhone:userData:error:` method (registered via
+    `NSApp.servicesProvider`), reads file URLs (modern `NSURL` objects with
+    an `NSFilenamesPboardType` legacy fallback) and feeds them into the
+    D3.1 queue — multi-selection queues every file. `sendDroppedFiles` now
+    sets a visible "Phone not connected" error instead of silently ignoring
+    sends while disconnected (covers icon drop + Services alike). No new
+    extension target; verified in the built bundle's Info.plist. Note: the
+    first launch may need `pbs -flush` (or a re-login) before macOS picks
+    up the new Services entry. Shortcuts/Quick Action support remains a
+    stretch.
+
+Suggested order: D1.1 → D1.3 → D1.4 → D3.1 → D3.2 → D1.5 → D1.2 → D3.3 →
+D2.2 → D2.3 → D2.1 (quick Mac-only wins first; accessibility injection last).
+
+Verification: extend the Swift suite for REMOTE_TEXT/OPEN_URL parsing +
+Mac queue logic; Android unit tests for new decoder cases (§6 commands);
+D2.1 and D3.2 are real-device-pass items (C5) before calling them done.
+
 ## 5. Critical Pitfalls (carried forward)
 
 1. **Google Play policy traps** — avoid `MANAGE_EXTERNAL_STORAGE` and
@@ -255,6 +406,10 @@ Everything else is roadmap, below.
    before approval fails silently — explain the permission in onboarding.
 4. **Never block the UI on transfers** — background queues on macOS,
    `Dispatchers.IO` on Android (A3.3).
+5. **Keyboard injection is IME/field-dependent (D2.1)** —
+   `ACTION_SET_TEXT` append fails or misbehaves on some fields/IMEs; always
+   ship the clipboard-push fallback and treat the accessibility path as
+   best-effort.
 
 ## 6. Verification & Tooling
 

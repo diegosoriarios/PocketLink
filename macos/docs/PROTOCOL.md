@@ -66,9 +66,11 @@ Connection policy (as implemented on Android):
 | `0x0052` | MIRROR_CONFIG | UTF-8 JSON: `{"width": <int>, "height": <int>, "fps": <int>, "bitrateBps": <int>, "sps": "<base64 Annex-B>", "pps": "<base64 Annex-B>"}` | Phone→Mac video stream parameters + H.264 parameter sets (phone→Mac only) |
 | `0x0053` | MIRROR_FRAME | Binary: `u64 timestampMs (BE) | u8 keyframe | u32 accessUnitLength (BE) | Annex-B access unit` | One H.264 encoded access unit (phone→Mac only) |
 | `0x0054` | REMOTE_TOUCH | UTF-8 JSON: `{"action": "down"\|"move"\|"up", "x": <0..1>, "y": <0..1>}` | Mac→phone touch injection; coordinates normalized to the captured display |
+| `0x0064` | REMOTE_TEXT | UTF-8 JSON: `{"text": "<non-empty str>"}` or `{"special": "backspace"\|"enter"}` (exactly one key) | Mac→phone keyboard injection; the phone appends the text (or applies the special key) to the focused editable node via `ACTION_SET_TEXT` (best-effort, no ACK in v1) |
 | `0x0060` | CRYPTO_M1 | Binary: 32 B (Noise XX `-> e`) | Initiator ephemeral key; raw Noise message, no extra length prefix |
 | `0x0061` | CRYPTO_M2 | Binary: 80 B + 112 B encrypted identity payload (Noise XX `<- e, ee, s, es`) | Responder ephemeral + static + identity |
 | `0x0062` | CRYPTO_M3 | Binary: 48 B + 112 B encrypted identity payload (Noise XX `-> s, se`) | Initiator static + identity |
+| `0x0065` | OPEN_URL | UTF-8 JSON: `{"url": "<str>"}` | Mac→phone; the phone opens the URL via an implicit `ACTION_VIEW` (http/https only; no ACK in v1) |
 
 JSON is UTF-8 with these exact, case-sensitive key names.
 

@@ -152,4 +152,46 @@ public enum MirrorMessages {
         }
         return TouchPoint(action: action, x: xNumber.doubleValue, y: yNumber.doubleValue)
     }
+
+    // MARK: - Text (Mac → phone)
+
+    public enum TextSpecial: String, Sendable, CaseIterable {
+        case backspace
+        case enter
+    }
+
+    /// One REMOTE_TEXT payload: either a non-empty committed text batch or a
+    /// single special key. Exactly one case is ever encoded.
+    public enum TextContent: Sendable, Equatable {
+        case text(String)
+        case special(TextSpecial)
+    }
+
+    public static func remoteTextFrame(_ content: TextContent, streamId: UInt32) throws -> Frame {
+        let object: [String: Any]
+        switch content {
+        case .text(let text):
+            guard !text.isEmpty else { return Frame(messageType: .remoteText, streamId: streamId, payloadString: "{}") }
+            object = ["text": text]
+        case .special(let special):
+            object = ["special": special.rawValue]
+        }
+        let data = try JSONSerialization.data(withJSONObject: object)
+        return Frame(messageType: .remoteText, streamId: streamId, payload: [UInt8](data))
+    }
+
+    public static func parseRemoteText(_ frame: Frame) -> TextContent? {
+        guard frame.messageType == .remoteText,
+              let object = try? JSONSerialization.jsonObject(with: Data(frame.payload)) as? [String: Any] else {
+            return nil
+        }
+        if let specialRaw = object["special"] as? String,
+           let special = TextSpecial(rawValue: specialRaw) {
+            return .special(special)
+        }
+        if let text = object["text"] as? String, !text.isEmpty {
+            return .text(text)
+        }
+        return nil
+    }
 }

@@ -4,6 +4,8 @@ import CoreImage.CIFilterBuiltins
 import Foundation
 import Network
 import Observation
+import ServiceManagement
+@preconcurrency import UserNotifications
 
 import LinkClipboard
 import LinkConnection
@@ -44,6 +46,17 @@ final class ConnectionViewModel {
 
     private(set) var phase: Phase = .idle
     private(set) var sendClipboardOnCopy = false
+    private(set) var launchAtLogin = false
+    private(set) var launchAtLoginHint = ""
+    private(set) var hasUnreadNotifications = false
+    private var lastSeenNotificationDate: Date?
+    var onUnreadNotificationsChanged: ((Bool) -> Void)?
+    private(set) var activeTransferProgress: Double?
+    var onTransferProgressChanged: ((Double?) -> Void)?
+    var openURLDraft = ""
+    private(set) var openURLStatus = ""
+    private var openURLStatusClearTask: Task<Void, Never>?
+    private var batteryAlertAdvisor = BatteryAlertAdvisor()
     private(set) var clipboardSyncStatus = ""
     var host = ""
     var portText = "52345"
@@ -69,10 +82,19 @@ final class ConnectionViewModel {
 
     private(set) var mirrorPhase: MirrorPhase = .idle
     private(set) var mirrorStatusText = ""
-    var mirrorWindowController: MirrorWindowController?
+    private(set) var mirrorVideoSize: CGSize?
+    private(set) var isMirrorPoppedOut = false
+    private(set) var mirrorTouchView: TouchForwardingView?
+    private var mirrorWindowController: MirrorWindowController?
+    private var mirrorRecorder: MirrorRecorder?
+    private var recordingStartedAt: Date?
+    private(set) var isMirrorRecording = false
+    private(set) var recordingStatusText = ""
+    private var recordingStatusClearTask: Task<Void, Never>?
 
     struct OutgoingTransfer: Identifiable, Equatable {
         enum State: Equatable {
+            case queued
             case sending
             case awaitingAck
             case delivered
@@ -113,6 +135,7 @@ final class ConnectionViewModel {
     private let transferHistoryStore: TransferHistoryStore
     private let notificationStore: NotificationStore
     private var isSendingFile = false
+    private var pendingSendURLs: [(id: String, url: URL)] = []
     private var activeSendTask: Task<Void, Never>?
     private var ackTimeoutTask: Task<Void, Never>?
     private var activeOpenPanel: NSOpenPanel?
@@ -204,14 +227,37 @@ final class ConnectionViewModel {
         refreshTrustedPeers()
         refreshTransferHistory()
         refreshNotifications()
+        syncLaunchAtLoginState()
         observeSleepWake()
     }
 
     private func refreshNotifications() {
         Task { [weak self] in
             guard let self else { return }
-            self.notifications = await self.notificationStore.all()
+            self.updateNotifications(await self.notificationStore.all())
         }
+    }
+
+    /// Central notifications setter: recomputes the unread flag against the
+    /// last-seen threshold so the status item badge stays in sync.
+    private func updateNotifications(_ value: [LinkNotification]) {
+        notifications = value
+        hasUnreadNotifications = value.contains { notification in
+            guard let threshold = lastSeenNotificationDate else { return true }
+            return notification.postTime > threshold
+        }
+        onUnreadNotificationsChanged?(hasUnreadNotifications)
+    }
+
+    /// Called when the panel becomes visible (and again when it closes, to
+    /// catch arrivals shown while it was open). Notification timestamps come
+    /// from the phone, so the threshold is the newest known postTime —
+    /// never local "now" (device clocks can differ).
+    func markNotificationsSeen() {
+        lastSeenNotificationDate = notifications.first?.postTime
+        guard hasUnreadNotifications else { return }
+        hasUnreadNotifications = false
+        onUnreadNotificationsChanged?(false)
     }
 
     private func observeSleepWake() {
@@ -303,6 +349,7 @@ final class ConnectionViewModel {
             self.trustedPeers = await self.trustStore.trustedPeers()
             if self.client != nil {
                 self.phase = .connected(display: display)
+                self.drainPendingSends()
             } else {
                 self.startSession(to: endpoint, peerId: peerId, display: display)
             }
@@ -326,7 +373,7 @@ final class ConnectionViewModel {
     }
 
     func clearNotifications() {
-        notifications = []
+        updateNotifications([])
         replyStatuses = [:]
         replyAckTasks.values.forEach { $0.cancel() }
         replyAckTasks = [:]
@@ -436,8 +483,100 @@ final class ConnectionViewModel {
         }
     }
 
+    func openURLOnPhone() {
+        let trimmed = openURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            openURLStatus = "Enter a valid http(s) URL"
+            scheduleOpenURLStatusClear()
+            return
+        }
+        guard client != nil, case .connected = phase else { return }
+        Task { [weak self] in
+            guard let self, let client = self.client else { return }
+            try? await client.send(OpenURLMessage.frame(url: trimmed, streamId: client.nextStreamId()))
+        }
+        openURLDraft = ""
+        openURLStatus = "Opening on phone…"
+        scheduleOpenURLStatusClear()
+    }
+
+    private func scheduleOpenURLStatusClear() {
+        openURLStatusClearTask?.cancel()
+        openURLStatusClearTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, !Task.isCancelled else { return }
+            self.openURLStatus = ""
+        }
+    }
+
+    /// Posts a user notification for a phone battery threshold crossing.
+    /// Authorization is requested lazily on first use.
+    private func postBatteryAlert(_ alert: BatteryAlertLevel, level: Int) {
+        let content = UNMutableNotificationContent()
+        switch alert {
+        case .low:
+            content.title = "Phone battery low"
+        case .critical:
+            content.title = "Phone battery critically low"
+        case .none:
+            return
+        }
+        content.body = "\(level)% remaining"
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "pocketlink.battery.\(alert == .critical ? "critical" : "low").\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            center.add(request)
+        }
+    }
+
+    // MARK: - Launch at Login
+    func setLaunchAtLogin(_ enabled: Bool) {
+        let service = SMAppService.mainApp
+        let isRegistered = service.status == .enabled || service.status == .requiresApproval
+        guard enabled != isRegistered else {
+            syncLaunchAtLoginState()
+            return
+        }
+        do {
+            if enabled {
+                try service.register()
+            } else {
+                try service.unregister()
+            }
+            launchAtLoginHint = ""
+        } catch {
+            launchAtLoginHint = "Launch at login failed: \(error.localizedDescription)"
+        }
+        syncLaunchAtLoginState()
+    }
+
+    /// SMAppService itself persists the registration — the system status is
+    /// the single source of truth, so the toggle always reflects it.
+    private func syncLaunchAtLoginState() {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            launchAtLogin = true
+            launchAtLoginHint = ""
+        case .requiresApproval:
+            launchAtLogin = true
+            launchAtLoginHint = "Approve PocketLink in System Settings → Login Items to activate."
+        case .notRegistered, .notFound:
+            launchAtLogin = false
+        @unknown default:
+            launchAtLogin = false
+        }
+    }
+
     func sendClipboardToPhone() {
-        guard let client, case .connected = phase else { return }
+        guard client != nil, case .connected = phase else { return }
         guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
             lastDeviceError = "Clipboard is empty"
             return
@@ -616,6 +755,13 @@ final class ConnectionViewModel {
         heartbeatTask = nil
         pendingPing = nil
         endMirroring(sendStop: false, statusText: "")
+        if !pendingSendURLs.isEmpty {
+            pendingSendURLs.removeAll()
+            for transfer in outgoingTransfers where transfer.state == .queued {
+                updateOutgoing(fileId: transfer.fileId) { $0.state = .failed("Disconnected") }
+            }
+        }
+        batteryAlertAdvisor = BatteryAlertAdvisor()
         stopBrowsing()
         guard let oldClient = client else { return }
         client = nil
@@ -634,7 +780,7 @@ final class ConnectionViewModel {
     }
 
     func startMirroring() {
-        guard let client, case .connected = phase, mirrorPhase == .idle else { return }
+        guard client != nil, case .connected = phase, mirrorPhase == .idle else { return }
         mirrorPhase = .requesting
         mirrorStatusText = "Waiting for phone…"
         Task { [weak self] in
@@ -654,6 +800,112 @@ final class ConnectionViewModel {
         endMirroring(sendStop: true, statusText: "")
     }
 
+    /// Detaches the live video into a standalone window. The session keeps
+    /// running and the panel shows a placeholder while detached.
+    func popOutMirror() {
+        guard mirrorPhase == .active, let view = mirrorTouchView,
+              mirrorWindowController == nil else { return }
+        let controller = MirrorWindowController(
+            videoView: view,
+            dimensions: mirrorVideoSize ?? CGSize(width: 9, height: 19.5)
+        )
+        controller.onWindowClosed = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.mirrorWindowController = nil
+                self.isMirrorPoppedOut = false
+            }
+        }
+        mirrorWindowController = controller
+        isMirrorPoppedOut = true
+        controller.showAndActivate()
+    }
+
+    /// Closes the pop-out window so the video returns to the menu bar panel.
+    func returnMirrorToPanel() {
+        guard let controller = mirrorWindowController else { return }
+        controller.close()
+    }
+
+    // MARK: - Mirror Capture (screenshots & recording, Mac-local)
+
+    func toggleMirrorRecording() {
+        guard mirrorPhase == .active, let decoder = mirrorDecoder else { return }
+        if mirrorRecorder != nil {
+            stopMirrorRecording()
+            return
+        }
+        guard let format = decoder.currentFormatDescription else {
+            lastDeviceError = "Recording failed: no video format yet"
+            return
+        }
+        let directory = supportDirectory.appendingPathComponent("Recordings", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("PocketLink Mirror \(Self.fileTimestamp()).mp4")
+            let recorder = MirrorRecorder()
+            try recorder.start(url: url, formatDescription: format)
+            mirrorRecorder = recorder
+            recordingStartedAt = Date()
+            isMirrorRecording = true
+            recordingStatusText = "Recording…"
+        } catch {
+            lastDeviceError = "Recording failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func stopMirrorRecording() {
+        guard let recorder = mirrorRecorder else { return }
+        mirrorRecorder = nil
+        isMirrorRecording = false
+        recordingStartedAt = nil
+        recordingStatusText = "Finishing recording…"
+        recorder.finish { [weak self] url, error in
+            Task { @MainActor [weak self] in
+                self?.recordingDidFinish(url: url, error: error)
+            }
+        }
+    }
+
+    private func recordingDidFinish(url: URL?, error: Error?) {
+        if let url {
+            recordingStatusText = "Saved: Recordings/\(url.lastPathComponent)"
+        } else if let error {
+            recordingStatusText = "Recording failed: \(error.localizedDescription)"
+        } else {
+            recordingStatusText = ""
+        }
+        recordingStatusClearTask?.cancel()
+        recordingStatusClearTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard let self, !Task.isCancelled, !self.isMirrorRecording else { return }
+            self.recordingStatusText = ""
+        }
+    }
+
+    func captureMirrorScreenshot() {
+        guard mirrorPhase == .active, let decoder = mirrorDecoder,
+              let png = decoder.screenshotPNG() else {
+            lastDeviceError = "Screenshot failed — no frame available yet"
+            return
+        }
+        let directory = supportDirectory.appendingPathComponent("Screenshots", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("PocketLink Screenshot \(Self.fileTimestamp()).png")
+            try png.write(to: url)
+            NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: directory.path)
+        } catch {
+            lastDeviceError = "Screenshot failed: \(error.localizedDescription)"
+        }
+    }
+
+    private static func fileTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH-mm-ss"
+        return formatter.string(from: Date())
+    }
+
     private func endMirroring(sendStop: Bool, statusText: String) {
         mirrorStartTimeoutTask?.cancel()
         mirrorStartTimeoutTask = nil
@@ -665,12 +917,26 @@ final class ConnectionViewModel {
             controller.close()
         }
         mirrorWindowController = nil
+        if let recorder = mirrorRecorder {
+            mirrorRecorder = nil
+            isMirrorRecording = false
+            recordingStartedAt = nil
+            recordingStatusText = "Finishing recording…"
+            recorder.finish { [weak self] url, error in
+                Task { @MainActor [weak self] in
+                    self?.recordingDidFinish(url: url, error: error)
+                }
+            }
+        }
+        mirrorTouchView = nil
+        mirrorVideoSize = nil
+        isMirrorPoppedOut = false
         mirrorDecoder?.invalidate()
         mirrorDecoder = nil
         let wasActive = mirrorPhase != .idle
         mirrorPhase = .idle
         mirrorStatusText = statusText
-        if sendStop, wasActive, let client, case .connected = phase {
+        if sendStop, wasActive, client != nil, case .connected = phase {
             Task { [weak self] in
                 guard let self, let client = self.client else { return }
                 try? await client.send(MirrorMessages.stopFrame(streamId: client.nextStreamId()))
@@ -718,19 +984,17 @@ final class ConnectionViewModel {
                 self?.sendRemoteTouch(action: action, x: point.x, y: point.y)
             }
         }
-
-        let controller = MirrorWindowController(
-            videoView: view,
-            dimensions: CGSize(width: config.width, height: config.height)
-        )
-        controller.onWindowClosed = { [weak self] in
+        view.onRemoteText = { [weak self] content in
             Task { @MainActor [weak self] in
-                guard let self, self.mirrorPhase != .idle else { return }
-                self.stopMirroring()
+                self?.sendRemoteText(content)
             }
         }
-        mirrorWindowController = controller
-        controller.showAndActivate()
+        mirrorTouchView = view
+        mirrorVideoSize = CGSize(width: config.width, height: config.height)
+        isMirrorPoppedOut = false
+        decoder.onSampleBuffer = { [weak self] sample in
+            self?.mirrorRecorder?.append(sample)
+        }
 
         mirrorPhase = .active
         mirrorStatusText = "Mirroring \(config.width)×\(config.height)"
@@ -747,11 +1011,21 @@ final class ConnectionViewModel {
     }
 
     private func sendRemoteTouch(action: MirrorMessages.TouchAction, x: Double, y: Double) {
-        guard mirrorPhase == .active, let client, case .connected = phase else { return }
+        guard mirrorPhase == .active, client != nil, case .connected = phase else { return }
         let point = MirrorMessages.TouchPoint(action: action, x: x, y: y)
         Task { [weak self] in
             guard let self, let client = self.client else { return }
             try? await client.send(MirrorMessages.touchFrame(point, streamId: client.nextStreamId()))
+        }
+    }
+
+    private func sendRemoteText(_ content: MirrorMessages.TextContent) {
+        guard mirrorPhase == .active, client != nil, case .connected = phase else { return }
+        Task { [weak self] in
+            guard let self, let client = self.client else { return }
+            try? await client.send(
+                MirrorMessages.remoteTextFrame(content, streamId: client.nextStreamId())
+            )
         }
     }
 
@@ -770,6 +1044,13 @@ final class ConnectionViewModel {
                     self.mirrorStatusText = String(
                         format: "Mirroring %d×%d · %d fps",
                         Int(size.width), Int(size.height), fps
+                    )
+                }
+                if self.isMirrorRecording, let startedAt = self.recordingStartedAt {
+                    let elapsed = Int(Date().timeIntervalSince(startedAt))
+                    self.recordingStatusText = String(
+                        format: "Recording · %02d:%02d",
+                        elapsed / 60, elapsed % 60
                     )
                 }
             }
@@ -1002,7 +1283,7 @@ final class ConnectionViewModel {
             Task { [weak self] in
                 guard let self else { return }
                 await self.notificationStore.record(notification)
-                self.notifications = await self.notificationStore.all()
+                self.updateNotifications(await self.notificationStore.all())
             }
         case .notificationReplyAck:
             guard let ack = NotificationReplyAck.parse(frame) else { return }
@@ -1010,7 +1291,12 @@ final class ConnectionViewModel {
             replyAckTasks[ack.id] = nil
             setReplyStatus(ack.id, ack.success ? "Delivered ✓" : "Failed — phone reported error")
         case .battery:
-            phoneBattery = BatteryMessage.parse(frame)
+            if let battery = BatteryMessage.parse(frame) {
+                phoneBattery = battery
+                if let alert = batteryAlertAdvisor.alert(for: battery.level, isCharging: battery.isCharging) {
+                    postBatteryAlert(alert, level: battery.level)
+                }
+            }
         case .mirrorConfig:
             guard let config = MirrorMessages.parseConfig(frame) else { return }
             handleMirrorConfig(config)
@@ -1048,6 +1334,7 @@ final class ConnectionViewModel {
             self.trustedPeers = await self.trustStore.trustedPeers()
         }
         phase = .connected(display: display)
+        drainPendingSends()
     }
 
     private func updateTransfer(_ progress: FileReceiver.Progress) {
@@ -1059,10 +1346,39 @@ final class ConnectionViewModel {
         if progress.state != .receiving {
             recordIncomingHistory(progress)
         }
+        syncTransferProgress()
+    }
+
+    /// Aggregate fraction (0…1) across all in-flight transfers, nil when
+    /// idle — drives the status item progress ring.
+    private func syncTransferProgress() {
+        var fractions: [Double] = []
+        for transfer in outgoingTransfers {
+            switch transfer.state {
+            case .sending:
+                guard transfer.totalBytes > 0 else { continue }
+                fractions.append(min(1, Double(transfer.sentBytes) / Double(transfer.totalBytes)))
+            case .awaitingAck:
+                fractions.append(1)
+            case .queued, .delivered, .mismatch, .failed:
+                break
+            }
+        }
+        for progress in fileTransfers {
+            switch progress.state {
+            case .receiving:
+                guard progress.metadata.size > 0 else { continue }
+                fractions.append(min(1, Double(progress.receivedBytes) / Double(progress.metadata.size)))
+            case .completed, .failed:
+                break
+            }
+        }
+        activeTransferProgress = fractions.isEmpty ? nil : fractions.reduce(0, +) / Double(fractions.count)
+        onTransferProgressChanged?(activeTransferProgress)
     }
 
     func pickAndSendFile() {
-        guard let client, case .connected = phase else { return }
+        guard client != nil, case .connected = phase else { return }
         guard activeOpenPanel == nil else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -1082,15 +1398,49 @@ final class ConnectionViewModel {
     }
 
     func sendDroppedFiles(_ urls: [URL]) {
-        guard isConnected, let url = urls.first else { return }
-        if urls.count > 1 {
-            lastDeviceError = "One transfer at a time — sending the first file"
+        guard isConnected, !urls.isEmpty else {
+            if !urls.isEmpty {
+                lastDeviceError = "Phone not connected — connect first, then send again"
+            }
+            return
         }
-        sendFile(at: url)
+        // Reversed so the newest-first transfer list ends up in drop order.
+        for url in urls.reversed() {
+            queueOutgoing(url)
+        }
+        drainPendingSends()
+    }
+
+    private func queueOutgoing(_ url: URL) {
+        let size = ((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize).map(Int64.init) ?? 0
+        let id = UUID().uuidString
+        upsertOutgoing(
+            OutgoingTransfer(
+                fileId: id,
+                fileURL: url,
+                name: url.lastPathComponent,
+                totalBytes: size,
+                state: .queued
+            )
+        )
+        pendingSendURLs.append((id: id, url: url))
+    }
+
+    private func drainPendingSends() {
+        guard !isSendingFile, client != nil, case .connected = phase, !pendingSendURLs.isEmpty else { return }
+        let queued = pendingSendURLs.removeFirst()
+        // The queued placeholder row is replaced by the live row sendFile creates.
+        outgoingTransfers.removeAll { $0.id == queued.id }
+        syncTransferProgress()
+        sendFile(at: queued.url)
     }
 
     func cancelOutgoing(_ transfer: OutgoingTransfer) {
         switch transfer.state {
+        case .queued:
+            pendingSendURLs.removeAll { $0.id == transfer.fileId }
+            outgoingTransfers.removeAll { $0.id == transfer.id }
+            syncTransferProgress()
         case .sending:
             activeSendTask?.cancel()
         case .awaitingAck:
@@ -1100,6 +1450,7 @@ final class ConnectionViewModel {
             sendFileCancel(fileId: transfer.fileId)
             updateOutgoing(fileId: transfer.fileId) { $0.state = .failed("Cancelled") }
             recordOutgoingHistory(fileId: transfer.fileId)
+            drainPendingSends()
         default:
             break
         }
@@ -1146,8 +1497,8 @@ final class ConnectionViewModel {
 
     private func sendFile(at url: URL) {
         guard let client, case .connected = phase else { return }
-        guard !isSendingFile else {
-            lastDeviceError = "A file transfer is already in progress"
+        guard !isSendingFile, pendingSendURLs.isEmpty else {
+            queueOutgoing(url)
             return
         }
         isSendingFile = true
@@ -1156,6 +1507,7 @@ final class ConnectionViewModel {
             defer {
                 self.isSendingFile = false
                 self.activeSendTask = nil
+                self.drainPendingSends()
             }
             do {
                 let metadata = try FileSender.prepare(fileURL: url)
@@ -1181,6 +1533,7 @@ final class ConnectionViewModel {
             } catch {
                 self.isSendingFile = false
                 self.lastDeviceError = "Cannot send that file"
+                self.drainPendingSends()
             }
         }
     }
@@ -1191,11 +1544,13 @@ final class ConnectionViewModel {
         if outgoingTransfers.count > 10 {
             outgoingTransfers.removeLast(outgoingTransfers.count - 10)
         }
+        syncTransferProgress()
     }
 
     private func updateOutgoing(fileId: String, transform: (inout OutgoingTransfer) -> Void) {
         guard let index = outgoingTransfers.firstIndex(where: { $0.id == fileId }) else { return }
         transform(&outgoingTransfers[index])
+        syncTransferProgress()
     }
 
     private func updateOutgoingIfActive(fileId: String, transform: (inout OutgoingTransfer) -> Void) {
@@ -1203,6 +1558,7 @@ final class ConnectionViewModel {
               outgoingTransfers[index].state == .sending || outgoingTransfers[index].state == .awaitingAck
         else { return }
         transform(&outgoingTransfers[index])
+        syncTransferProgress()
     }
 
     private func recordOutgoingHistory(fileId: String) {
@@ -1212,7 +1568,7 @@ final class ConnectionViewModel {
         case .delivered: state = .delivered
         case .mismatch: state = .mismatch
         case .failed(let message): state = .failed(message)
-        case .sending, .awaitingAck: return
+        case .queued, .sending, .awaitingAck: return
         }
         let entry = TransferHistoryEntry(
             id: transfer.fileId,

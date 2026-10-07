@@ -8,7 +8,7 @@ import LinkPairing
 import LinkProtocol
 
 struct ConnectionStatusView: View {
-    @State private var model = ConnectionViewModel()
+    @Bindable var model: ConnectionViewModel
     @State private var isDropTargeted = false
 
     var body: some View {
@@ -68,12 +68,23 @@ struct ConnectionStatusView: View {
             }
 
             Divider()
+            Toggle("Launch at login", isOn: Binding(
+                get: { model.launchAtLogin },
+                set: { model.setLaunchAtLogin($0) }
+            ))
+            .font(.caption)
+            .toggleStyle(.checkbox)
+            if !model.launchAtLoginHint.isEmpty {
+                Text(model.launchAtLoginHint)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             Button("Quit PocketLink") {
                 NSApplication.shared.terminate(nil)
             }
         }
         .padding(14)
-        .frame(width: 280, alignment: .leading)
+        .frame(width: model.mirrorPhase == .active ? 420 : 280, alignment: .leading)
         .overlay {
             if isDropTargeted {
                 ZStack {
@@ -242,6 +253,19 @@ struct ConnectionStatusView: View {
                 .toggleStyle(.checkbox)
             }
             Button("Send file to phone…") { model.pickAndSendFile() }
+            HStack(spacing: 8) {
+                TextField("https://…", text: $model.openURLDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .onSubmit { model.openURLOnPhone() }
+                Button("Open on phone") { model.openURLOnPhone() }
+                    .disabled(model.openURLDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if !model.openURLStatus.isEmpty {
+                Text(model.openURLStatus)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             Divider()
             HStack(spacing: 10) {
                 Button(mirrorButtonLabel) { model.toggleMirroring() }
@@ -256,6 +280,60 @@ struct ConnectionStatusView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if model.mirrorPhase == .active {
+                mirrorVideoSection
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var mirrorVideoSection: some View {
+        if model.isMirrorPoppedOut {
+            Label("Mirroring in a separate window", systemImage: "rectangle.on.rectangle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+        } else if let size = model.mirrorVideoSize, let videoView = model.mirrorTouchView {
+            MirrorVideoView(videoView: videoView)
+                .aspectRatio(size.width / max(size.height, 1), contentMode: .fit)
+                .frame(maxWidth: .infinity, maxHeight: 520)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(.quaternary)
+                }
+                .help("Click or drag on the video to control your phone")
+        }
+        HStack(spacing: 10) {
+            Button(model.isMirrorPoppedOut ? "Return to panel" : "Pop out") {
+                if model.isMirrorPoppedOut {
+                    model.returnMirrorToPanel()
+                } else {
+                    model.popOutMirror()
+                }
+            }
+            Spacer()
+            Button {
+                model.captureMirrorScreenshot()
+            } label: {
+                Image(systemName: "camera")
+            }
+            .disabled(model.mirrorTouchView == nil)
+            .help("Save a screenshot of the mirrored screen")
+
+            Button {
+                model.toggleMirrorRecording()
+            } label: {
+                Image(systemName: model.isMirrorRecording ? "stop.circle.fill" : "record.circle")
+                    .foregroundStyle(model.isMirrorRecording ? .red : .primary)
+            }
+            .disabled(model.mirrorTouchView == nil)
+            .help(model.isMirrorRecording ? "Stop recording" : "Record the mirrored screen to an MP4")
+        }
+        if !model.recordingStatusText.isEmpty {
+            Text(model.recordingStatusText)
+                .font(.caption)
+                .foregroundStyle(model.isMirrorRecording ? .red : .secondary)
         }
     }
 
@@ -425,7 +503,7 @@ struct ConnectionStatusView: View {
                     }
                     Spacer()
                     switch transfer.state {
-                    case .sending, .awaitingAck:
+                    case .queued, .sending, .awaitingAck:
                         Button("Cancel") { model.cancelOutgoing(transfer) }
                             .buttonStyle(.borderless)
                             .font(.caption)
@@ -534,6 +612,9 @@ struct ConnectionStatusView: View {
     @ViewBuilder
     private func outgoingIcon(_ transfer: ConnectionViewModel.OutgoingTransfer) -> some View {
         switch transfer.state {
+        case .queued:
+            Image(systemName: "clock")
+                .foregroundStyle(.secondary)
         case .sending, .awaitingAck:
             Image(systemName: "arrow.up.circle")
                 .foregroundStyle(.secondary)
@@ -552,6 +633,8 @@ struct ConnectionStatusView: View {
     private func outgoingStatusText(_ transfer: ConnectionViewModel.OutgoingTransfer) -> String {
         let total = ByteCountFormatter.string(fromByteCount: transfer.totalBytes, countStyle: .file)
         switch transfer.state {
+        case .queued:
+            return "Queued · \(total)"
         case .sending:
             let sent = ByteCountFormatter.string(fromByteCount: transfer.sentBytes, countStyle: .file)
             return "\(sent) of \(total)"

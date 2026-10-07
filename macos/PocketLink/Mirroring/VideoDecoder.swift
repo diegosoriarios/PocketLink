@@ -1,4 +1,5 @@
 import AVFoundation
+import AppKit
 import CoreMedia
 import Foundation
 
@@ -24,6 +25,13 @@ final class VideoDecoder {
 
     /// The layer hosting the decoded video. Install into a view once.
     var displayLayer: AVSampleBufferDisplayLayer { layer }
+
+    /// Called with every ready AVCC sample buffer (before it is enqueued
+    /// into the display layer) — used by the session recorder.
+    var onSampleBuffer: ((CMSampleBuffer) -> Void)?
+
+    /// The active H.264 format description, or nil before the first config.
+    var currentFormatDescription: CMVideoFormatDescription? { formatDescription }
 
     var dimensions: CGSize {
         guard let format = formatDescription else { return .zero }
@@ -138,6 +146,30 @@ final class VideoDecoder {
         layer.enqueue(buffer)
         lastPresentedPTS = pts
         decodedFrames += 1
+        onSampleBuffer?(buffer)
+    }
+
+    /// Renders the layer's most recently displayed frame to PNG data at the
+    /// decoded video dimensions. Returns nil before the first frame.
+    func screenshotPNG() -> Data? {
+        let size = dimensions
+        guard size.width >= 1, size.height >= 1,
+              let context = CGContext(
+                data: nil,
+                width: Int(size.width),
+                height: Int(size.height),
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
+        context.setFillColor(CGColor(gray: 0, alpha: 1))
+        context.fill(CGRect(origin: .zero, size: size))
+        layer.render(in: context)
+        guard let image = context.makeImage() else { return nil }
+        return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
     }
 
     func invalidate() {
