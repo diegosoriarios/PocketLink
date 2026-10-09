@@ -902,50 +902,74 @@ class ConnectionManager(
             // Frames are atomic units on the wire: serialize writes so concurrent
             // producers (file chunks, heartbeat, ACKs) cannot interleave bytes.
             writeMutex.withLock {
-                val activeChannel = channel
-                when {
-                    activeChannel != null && !frame.header.messageType.isCryptoHandshake -> {
-                        // Seal the payload; the 16-byte wire header (with
-                        // payloadLength = ciphertext size) is the AEAD AAD.
-                        try {
-                            val header = wireHeaderBytes(
-                                version = frame.header.version,
-                                messageType = frame.header.messageType,
-                                streamId = frame.header.streamId,
-                                payloadLength = frame.payload.size + 16
-                            )
-                            val sealed = activeChannel.seal(header, frame.payload)
-                            val outputStream: OutputStream = socket.getOutputStream()
-                            outputStream.write(header + sealed)
-                            outputStream.flush()
-                            true
-                        } catch (e: NoiseException) {
-                            logEvent("Failed to seal frame: ${e.message}")
-                            false
-                        } catch (e: Exception) {
-                            logEvent("Failed to write frame to socket: ${e.message}")
-                            false
-                        }
+                if (socket.isClosed) return@withLock false
+                // Watchdog: when the peer stops reading (roamed Wi-Fi, napped
+                // host), a blocking write would hold writeMutex forever — every
+                // producer stalls, and the read loop blocks on its first PONG
+                // reply, deafening the connection while it still reports
+                // Connected. Closing the socket unblocks the writer with an
+                // exception and lets teardown proceed.
+                val watchdog = scope.launch {
+                    delay(WRITE_TIMEOUT_MS)
+                    if (!socket.isClosed) {
+                        logEvent("Frame write stalled >${WRITE_TIMEOUT_MS / 1000}s; closing connection")
+                        runCatching { socket.close() }
                     }
-                    activeChannel == null && !frame.header.messageType.isCryptoHandshake &&
-                        frame.header.messageType != MessageType.ERROR -> {
-                        // Channel not ready yet: queue the plaintext frame.
-                        bufferUntilChannelReady(frame)
-                        true
-                    }
-                    else -> {
-                        // Handshake frames and pre-channel ERROR frames go out raw.
-                        try {
-                            val encoded = ProtocolEncoder.encode(frame)
-                            val outputStream: OutputStream = socket.getOutputStream()
-                            outputStream.write(encoded)
-                            outputStream.flush()
-                            true
-                        } catch (e: Exception) {
-                            logEvent("Failed to write frame to socket: ${e.message}")
-                            false
-                        }
-                    }
+                }
+                val success = try {
+                    writeFrameLocked(socket, frame)
+                } finally {
+                    watchdog.cancel()
+                }
+                success
+            }
+        }
+    }
+
+    /** Caller must hold writeMutex. Returns false when the frame was not sent. */
+    private fun writeFrameLocked(socket: Socket, frame: Frame): Boolean {
+        val activeChannel = channel
+        return when {
+            activeChannel != null && !frame.header.messageType.isCryptoHandshake -> {
+                // Seal the payload; the 16-byte wire header (with
+                // payloadLength = ciphertext size) is the AEAD AAD.
+                try {
+                    val header = wireHeaderBytes(
+                        version = frame.header.version,
+                        messageType = frame.header.messageType,
+                        streamId = frame.header.streamId,
+                        payloadLength = frame.payload.size + 16
+                    )
+                    val sealed = activeChannel.seal(header, frame.payload)
+                    val outputStream: OutputStream = socket.getOutputStream()
+                    outputStream.write(header + sealed)
+                    outputStream.flush()
+                    true
+                } catch (e: NoiseException) {
+                    logEvent("Failed to seal frame: ${e.message}")
+                    false
+                } catch (e: Exception) {
+                    logEvent("Failed to write frame to socket: ${e.message}")
+                    false
+                }
+            }
+            activeChannel == null && !frame.header.messageType.isCryptoHandshake &&
+                frame.header.messageType != MessageType.ERROR -> {
+                // Channel not ready yet: queue the plaintext frame.
+                bufferUntilChannelReady(frame)
+                true
+            }
+            else -> {
+                // Handshake frames and pre-channel ERROR frames go out raw.
+                try {
+                    val encoded = ProtocolEncoder.encode(frame)
+                    val outputStream: OutputStream = socket.getOutputStream()
+                    outputStream.write(encoded)
+                    outputStream.flush()
+                    true
+                } catch (e: Exception) {
+                    logEvent("Failed to write frame to socket: ${e.message}")
+                    false
                 }
             }
         }
@@ -995,5 +1019,8 @@ class ConnectionManager(
         private const val HEARTBEAT_INTERVAL_MS = 12_000L
         private const val MAX_MISSED_HEARTBEATS = 2
         private const val CLIPBOARD_ACK_TIMEOUT_MS = 5_000L
+
+        /** Bound on a single socket write before the watchdog closes the socket. */
+        private const val WRITE_TIMEOUT_MS = 10_000L
     }
 }

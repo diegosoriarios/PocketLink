@@ -2,6 +2,7 @@ import AVFoundation
 import AppKit
 import CoreMedia
 import Foundation
+import os
 
 /// Decodes the phone's H.264 Annex-B stream and renders it into an
 /// `AVSampleBufferDisplayLayer`.
@@ -16,12 +17,18 @@ final class VideoDecoder {
         case invalidFormatDescription
     }
 
+    private static let log = Logger(subsystem: "com.diego.pocketlink", category: "video-decoder")
+
     private let layer = AVSampleBufferDisplayLayer()
 
     private var formatDescription: CMVideoFormatDescription?
     private var lastPresentedPTS: CMTime = .invalid
     private var decodedFrames = 0
     private var droppedFrames = 0
+    /// Set after a decode-layer failure or a reconfiguration: delta frames
+    /// reference a keyframe that is no longer queued, so they must be dropped
+    /// until the next sync frame arrives (MediaCodec emits one every second).
+    private var waitingForSyncFrame = true
 
     /// The layer hosting the decoded video. Install into a view once.
     var displayLayer: AVSampleBufferDisplayLayer { layer }
@@ -82,6 +89,7 @@ final class VideoDecoder {
         lastPresentedPTS = .invalid
         decodedFrames = 0
         droppedFrames = 0
+        waitingForSyncFrame = true
         layer.flush()
     }
 
@@ -97,6 +105,14 @@ final class VideoDecoder {
             droppedFrames += 1
             return
         }
+
+        // Delta frames are useless without their reference frame (e.g. after
+        // a layer flush) — hold decode until the next sync frame.
+        if waitingForSyncFrame && !keyframe {
+            droppedFrames += 1
+            return
+        }
+        waitingForSyncFrame = false
 
         let avccData = AnnexBNALParser.avccData(fromAnnexB: accessUnit)
         guard !avccData.isEmpty,
@@ -144,6 +160,16 @@ final class VideoDecoder {
             )
         }
         layer.enqueue(buffer)
+        // enqueue is asynchronous and non-throwing; decode errors surface
+        // through the layer status afterwards. Flush and re-sync on the next
+        // keyframe instead of feeding deltas against a broken reference.
+        if layer.status == .failed {
+            Self.log.error("Display layer failed: \(self.layer.error?.localizedDescription ?? "unknown error", privacy: .public)")
+            droppedFrames += 1
+            layer.flush()
+            waitingForSyncFrame = true
+            return
+        }
         lastPresentedPTS = pts
         decodedFrames += 1
         onSampleBuffer?(buffer)
@@ -178,6 +204,7 @@ final class VideoDecoder {
         lastPresentedPTS = .invalid
         decodedFrames = 0
         droppedFrames = 0
+        waitingForSyncFrame = true
     }
 }
 

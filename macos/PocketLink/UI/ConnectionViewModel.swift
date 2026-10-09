@@ -91,6 +91,7 @@ final class ConnectionViewModel {
     private(set) var isMirrorRecording = false
     private(set) var recordingStatusText = ""
     private var recordingStatusClearTask: Task<Void, Never>?
+    private var mirrorActivity: NSObjectProtocol?
 
     struct OutgoingTransfer: Identifiable, Equatable {
         enum State: Equatable {
@@ -153,6 +154,7 @@ final class ConnectionViewModel {
     private var mirrorStartTimeoutTask: Task<Void, Never>?
     private var mirrorStatsTask: Task<Void, Never>?
     private var mirrorLastDecodedCount = 0
+    private var mirrorLastDroppedCount = 0
     private var lastEndpoint: NWEndpoint?
     private var lastPeerId: String?
     private var lastDisplay: String?
@@ -781,6 +783,7 @@ final class ConnectionViewModel {
 
     func startMirroring() {
         guard client != nil, case .connected = phase, mirrorPhase == .idle else { return }
+        beginMirrorActivity()
         mirrorPhase = .requesting
         mirrorStatusText = "Waiting for phone…"
         Task { [weak self] in
@@ -798,6 +801,24 @@ final class ConnectionViewModel {
     func stopMirroring() {
         guard mirrorPhase != .idle else { return }
         endMirroring(sendStop: true, statusText: "")
+    }
+
+    /// While mirroring, the video usually lives in the transient popover, so
+    /// the app is a background agent with no visible windows — exactly the
+    /// state where App Nap throttles timers and I/O and stalls the frame
+    /// stream. The assertion runs from request to teardown.
+    private func beginMirrorActivity() {
+        guard mirrorActivity == nil else { return }
+        mirrorActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated],
+            reason: "PocketLink screen mirroring"
+        )
+    }
+
+    private func endMirrorActivity() {
+        guard let activity = mirrorActivity else { return }
+        mirrorActivity = nil
+        ProcessInfo.processInfo.endActivity(activity)
     }
 
     /// Detaches the live video into a standalone window. The session keeps
@@ -907,11 +928,13 @@ final class ConnectionViewModel {
     }
 
     private func endMirroring(sendStop: Bool, statusText: String) {
+        endMirrorActivity()
         mirrorStartTimeoutTask?.cancel()
         mirrorStartTimeoutTask = nil
         mirrorStatsTask?.cancel()
         mirrorStatsTask = nil
         mirrorLastDecodedCount = 0
+        mirrorLastDroppedCount = 0
         if let controller = mirrorWindowController {
             controller.window?.delegate = nil
             controller.close()
@@ -965,13 +988,8 @@ final class ConnectionViewModel {
                 pps: config.pps
             )
         } catch {
-            mirrorPhase = .idle
-            mirrorStatusText = ""
+            endMirroring(sendStop: true, statusText: "")
             lastDeviceError = "Mirroring failed: unsupported video parameters"
-            Task { [weak self] in
-                guard let self, let client = self.client else { return }
-                try? await client.send(MirrorMessages.stopFrame(streamId: client.nextStreamId()))
-            }
             return
         }
 
@@ -1039,12 +1057,21 @@ final class ConnectionViewModel {
                 let stats = decoder.stats
                 let fps = stats.decoded - self.mirrorLastDecodedCount
                 self.mirrorLastDecodedCount = stats.decoded
+                let dropped = stats.dropped - self.mirrorLastDroppedCount
+                self.mirrorLastDroppedCount = stats.dropped
                 let size = decoder.dimensions
                 if size.width > 0 {
-                    self.mirrorStatusText = String(
-                        format: "Mirroring %d×%d · %d fps",
-                        Int(size.width), Int(size.height), fps
-                    )
+                    if dropped > 0 {
+                        self.mirrorStatusText = String(
+                            format: "Mirroring %dx%d · %d fps · %d dropped",
+                            Int(size.width), Int(size.height), fps, dropped
+                        )
+                    } else {
+                        self.mirrorStatusText = String(
+                            format: "Mirroring %dx%d · %d fps",
+                            Int(size.width), Int(size.height), fps
+                        )
+                    }
                 }
                 if self.isMirrorRecording, let startedAt = self.recordingStartedAt {
                     let elapsed = Int(Date().timeIntervalSince(startedAt))
@@ -1156,6 +1183,12 @@ final class ConnectionViewModel {
             case .failed(let reason):
                 phase = pairingAwarePhase(.failed(reason))
                 phoneBattery = nil
+                // Never let a mirror session survive a dropped connection —
+                // it would sit "active" at 0 fps with a frozen picture, and
+                // the stale state survives auto-reconnects.
+                if mirrorPhase != .idle {
+                    endMirroring(sendStop: false, statusText: "Connection lost — mirroring stopped")
+                }
                 if !isUserDisconnect {
                     lastDeviceError = "Connection lost — \(reason)"
                     outcome = .droppedUnexpectedly
@@ -1167,6 +1200,9 @@ final class ConnectionViewModel {
                     phoneBattery = nil
                     lastDeviceError = "Disconnected"
                     outcome = .droppedUnexpectedly
+                }
+                if mirrorPhase != .idle {
+                    endMirroring(sendStop: false, statusText: "Connection lost — mirroring stopped")
                 }
                 break loop
             }

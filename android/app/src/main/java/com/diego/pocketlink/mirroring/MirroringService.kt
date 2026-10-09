@@ -148,6 +148,7 @@ class MirroringService : Service() {
     }
 
     private fun stopSession() {
+        val wasRunning = encoder != null || isRunning
         encoder?.stop()
         encoder = null
         projection = null
@@ -155,6 +156,14 @@ class MirroringService : Service() {
         _isRunningFlow.value = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        if (wasRunning) {
+            // Capture ended locally (encoder error, cast tile, projection
+            // revoked, disconnect cleanup). Without this frame the Mac keeps
+            // showing "Mirroring … 0 fps" with a frozen picture forever.
+            // A Mac-initiated stop echoes back harmlessly: the Mac ignores
+            // MIRROR_STOP once its session is already idle.
+            ConnectionService.sendMirrorStop()
+        }
     }
 
     fun stopMirroring() {

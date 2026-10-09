@@ -182,14 +182,24 @@ class MirroringAccessibilityService : AccessibilityService() {
             get() = instance != null
 
         fun dispatchTouch(action: String, xNorm: Double, yNorm: Double) {
-            instance?.handleTouch(action, xNorm, yNorm)
+            val service = instance
+            if (service == null) {
+                Log.w(TAG, "Dropped REMOTE_TOUCH $action: accessibility service not enabled")
+                return
+            }
+            service.handleTouch(action, xNorm, yNorm)
         }
 
         /** Exactly one of [text]/[special] is non-null (REMOTE_TEXT payload). */
         fun dispatchText(text: String?, special: String?) {
+            val service = instance
+            if (service == null) {
+                Log.w(TAG, "Dropped REMOTE_TEXT: accessibility service not enabled")
+                return
+            }
             when {
-                text != null -> instance?.handleText(text)
-                special != null -> instance?.handleSpecial(special)
+                text != null -> service.handleText(text)
+                special != null -> service.handleSpecial(special)
             }
         }
     }

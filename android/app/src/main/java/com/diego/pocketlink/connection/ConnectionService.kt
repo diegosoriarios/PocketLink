@@ -12,7 +12,9 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiManager.WifiLock
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
@@ -95,9 +97,22 @@ class ConnectionService : Service() {
             clipboardMgr.setRemoteClipboard(remoteText)
         }
 
+        // Accessibility IPC (dispatchGesture, ACTION_SET_TEXT, reply
+        // PendingIntents) can take hundreds of ms or stall entirely; running
+        // it inline on the socket read loop would delay frame reads, PONG
+        // replies and touch events alike. Post to the main handler instead.
+        val mainHandler = Handler(Looper.getMainLooper())
+        manager.onRemoteTouchReceived = { action, x, y ->
+            mainHandler.post { MirroringAccessibilityService.dispatchTouch(action, x, y) }
+        }
+        manager.onRemoteTextReceived = { text, special ->
+            mainHandler.post { MirroringAccessibilityService.dispatchText(text, special) }
+        }
         manager.onNotificationReplyReceived = { id, text ->
-            val success = LinkNotificationListenerService.instance?.handleReply(id, text) ?: false
-            instance?.connectionManager?.sendNotificationReplyAck(id, success)
+            mainHandler.post {
+                val success = LinkNotificationListenerService.instance?.handleReply(id, text) ?: false
+                instance?.connectionManager?.sendNotificationReplyAck(id, success)
+            }
         }
 
         manager.onNotificationActionReceived = { id, action ->
@@ -133,12 +148,6 @@ class ConnectionService : Service() {
         }
         manager.onMirrorStopRequested = {
             MirroringService.stop(this)
-        }
-        manager.onRemoteTouchReceived = { action, x, y ->
-            MirroringAccessibilityService.dispatchTouch(action, x, y)
-        }
-        manager.onRemoteTextReceived = { text, special ->
-            MirroringAccessibilityService.dispatchText(text, special)
         }
         manager.onOpenUrlReceived = { url ->
             openOnPhone(url)
