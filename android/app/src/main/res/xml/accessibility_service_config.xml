@@ -1,9 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- canRetrieveWindowContent is the minimum requirement for remote text
+     injection: without it rootInActiveWindow/findFocus always return null
+     and ACTION_SET_TEXT is impossible. Touch gestures only need
+     canPerformGestures. -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagDefault"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows"
     android:canPerformGestures="true"
-    android:canRetrieveWindowContent="false"
+    android:canRetrieveWindowContent="true"
     android:description="@string/accessibility_service_description"
     android:notificationTimeout="100" />

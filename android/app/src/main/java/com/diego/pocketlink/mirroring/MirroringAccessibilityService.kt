@@ -69,16 +69,12 @@ class MirroringAccessibilityService : AccessibilityService() {
      */
     private fun mutateFocusedEditable(transform: (String) -> String?) {
         try {
-            val root = rootInActiveWindow ?: run {
-                Log.d(TAG, "No active window for text injection")
-                return
-            }
-            val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: run {
-                Log.d(TAG, "No focused node for text injection")
+            val node = findFocusedEditable() ?: run {
+                Log.i(TAG, "Text injection skipped: no focused editable in any window")
                 return
             }
             if (!node.isEditable) {
-                Log.d(TAG, "Focused node is not editable; ignoring text")
+                Log.i(TAG, "Text injection skipped: focused node is not editable")
                 return
             }
             val current = node.text?.toString() ?: ""
@@ -89,10 +85,25 @@ class MirroringAccessibilityService : AccessibilityService() {
                     updated
                 )
             }
-            node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+            val applied = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+            Log.i(TAG, "Text injection ${if (applied) "applied" else "REFUSED"} (${updated.length} chars)")
         } catch (e: Exception) {
             Log.w(TAG, "Text injection failed: ${e.message}")
         }
+    }
+
+    /**
+     * The input-focused node, searched across every retrievable window.
+     * [rootInActiveWindow] alone is unreliable: right after a tap focuses a
+     * field the active window is often the IME, whose tree has no editable
+     * focus — the app window holding the field is then found via [windows].
+     */
+    private fun findFocusedEditable(): AccessibilityNodeInfo? {
+        rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let { return it }
+        for (window in windows) {
+            window.root?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let { return it }
+        }
+        return null
     }
 
     fun handleTouch(action: String, xNorm: Double, yNorm: Double) {
