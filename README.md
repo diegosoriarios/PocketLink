@@ -38,6 +38,40 @@ Each project keeps its own build tooling and instructions:
 - **Android:** see [`android/docs/build-and-test.md`](android/docs/build-and-test.md)
   (standard Gradle wrapper: `./gradlew` from `android/`).
 
+## Running
+
+**macOS** — from the repo root (requires Xcode selected, see
+[`macos/README.md`](macos/README.md)):
+
+```bash
+# Build
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild -project macos/PocketLink.xcodeproj -scheme PocketLink \
+  -configuration Debug build
+
+# Launch the freshly built app (menu bar only — no Dock icon)
+open "$(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild -project macos/PocketLink.xcodeproj -scheme PocketLink \
+  -configuration Debug -showBuildSettings \
+  | awk -F' = ' '/TARGET_BUILD_DIR/ {print $2; exit}')/PocketLink.app"
+```
+
+Or open `macos/PocketLink.xcodeproj` in Xcode and press Cmd+R.
+
+**Android** — with a device connected (`adb devices`) or an emulator running:
+
+```bash
+cd android
+
+# Install the debug APK on the connected device
+./gradlew :app:installDebug
+
+# Launch it
+adb shell monkey -p com.diego.pocketlink -c android.intent.category.LAUNCHER 1
+```
+
+Or open `android/` in Android Studio and press the Run button.
+
 ## Notes
 
 - Each subproject has its own `.gitignore` (Swift/Xcode and Android/Gradle
